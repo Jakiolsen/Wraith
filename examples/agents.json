@@ -1,0 +1,16 @@
+{
+  "agents": [
+    {
+      "id": "edge-eu-01",
+      "name": "Edge EU 01",
+      "environment": "production",
+      "location": "Copenhagen",
+      "base_url": "http://127.0.0.1:8088",
+      "capabilities": [
+        "health_check",
+        "collect_metrics",
+        "fetch_logs"
+      ]
+    }
+  ]
+}

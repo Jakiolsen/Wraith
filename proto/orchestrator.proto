@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package orchestrator;
+
+message Empty {}
+
+enum JobType {
+  JOB_TYPE_UNSPECIFIED = 0;
+  JOB_TYPE_HEALTH_CHECK = 1;
+  JOB_TYPE_COLLECT_METRICS = 2;
+  JOB_TYPE_FETCH_LOGS = 3;
+}
+
+message SubmitJobRequest {
+  string agent_id = 1;
+  JobType job_type = 2;
+  uint32 log_lines = 3;
+  string log_source = 4;
+}
+
+message SubmitJobResponse {
+  bool accepted = 1;
+  string job_id = 2;
+  string status = 3;
+  string summary = 4;
+  string details_json = 5;
+}
+
+message AgentSnapshot {
+  string id = 1;
+  string name = 2;
+  string environment = 3;
+  string location = 4;
+  string endpoint = 5;
+  bool online = 6;
+  string status = 7;
+  string last_seen = 8;
+  repeated string capabilities = 9;
+}
+
+message RecentJob {
+  string job_id = 1;
+  string agent_id = 2;
+  string agent_name = 3;
+  string action = 4;
+  string status = 5;
+  string submitted_at = 6;
+  string summary = 7;
+}
+
+message DashboardSnapshot {
+  repeated AgentSnapshot agents = 1;
+  repeated RecentJob recent_jobs = 2;
+  string generated_at = 3;
+}
+
+service Orchestrator {
+  rpc GetDashboard(Empty) returns (DashboardSnapshot);
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+}

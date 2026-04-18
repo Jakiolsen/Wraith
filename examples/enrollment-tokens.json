@@ -1,0 +1,11 @@
+{
+  "tokens": [
+    {
+      "label": "enrollment-dev-operator",
+      "token_hash": "0c9f59f6ef713246be9d0a613ce6c15ec8c7ecfc3ec44403dd48773bd9b1702b",
+      "expires_at": "2027-04-18T00:00:00Z",
+      "single_use": true,
+      "max_validity_days": 30
+    }
+  ]
+}
