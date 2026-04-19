@@ -120,8 +120,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "chrono",
  "clap",
+ "reqwest",
  "serde",
  "serde_json",
  "shared",
@@ -4092,10 +4094,12 @@ dependencies = [
  "sqlx",
  "time",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x509-parser",
 ]
 
 [[package]]

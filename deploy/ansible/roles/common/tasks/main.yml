@@ -1,0 +1,43 @@
+---
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - build-essential
+      - ca-certificates
+      - curl
+      - git
+      - openssl
+      - pkg-config
+      - protobuf-compiler
+    state: present
+    update_cache: true
+
+- name: Create Wraith group
+  ansible.builtin.group:
+    name: "{{ wraith_group }}"
+    system: true
+
+- name: Create Wraith user
+  ansible.builtin.user:
+    name: "{{ wraith_user }}"
+    group: "{{ wraith_group }}"
+    create_home: true
+    home: "/home/{{ wraith_user }}"
+    shell: /bin/bash
+    system: true
+
+- name: Create Wraith directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ wraith_user }}"
+    group: "{{ wraith_group }}"
+    mode: "0750"
+  loop:
+    - "{{ wraith_install_dir }}"
+    - "{{ wraith_install_dir }}/bin"
+    - "{{ wraith_install_dir }}/src"
+    - "{{ wraith_config_dir }}"
+    - "{{ wraith_data_dir }}"
+    - "{{ wraith_log_dir }}"
+    - "{{ wraith_cert_dir }}"

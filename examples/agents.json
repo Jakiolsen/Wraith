@@ -6,10 +6,17 @@
       "environment": "production",
       "location": "Copenhagen",
       "base_url": "http://127.0.0.1:8088",
+      "redirector_token": null,
+      "auth_token": "replace-with-a-long-random-agent-token",
       "capabilities": [
         "health_check",
         "collect_metrics",
-        "fetch_logs"
+        "fetch_logs",
+        "run_command"
+      ],
+      "command_ids": [
+        "uptime",
+        "collect_example_log"
       ]
     }
   ]

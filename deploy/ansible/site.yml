@@ -1,0 +1,21 @@
+---
+- name: Deploy Wraith control planes
+  hosts: control_planes
+  become: true
+  roles:
+    - role: common
+    - role: wireguard_server
+    - role: control_plane
+
+- name: Deploy Wraith agents
+  hosts: agents
+  become: true
+  roles:
+    - role: common
+    - role: agent
+
+- name: Deploy Wraith redirectors
+  hosts: redirectors
+  become: true
+  roles:
+    - role: redirector

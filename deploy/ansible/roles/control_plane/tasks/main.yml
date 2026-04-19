@@ -1,0 +1,342 @@
+---
+- name: Install control-plane firewall packages
+  ansible.builtin.apt:
+    name: ufw
+    state: present
+    update_cache: true
+
+- name: Validate control-plane source allowlists are configured
+  ansible.builtin.assert:
+    that:
+      - wraith_control_plane_allowed_grpc_cidrs | length > 0
+      - wraith_control_plane_allowed_https_cidrs | length > 0
+    fail_msg: Control-plane hosts require explicit allowed CIDRs for gRPC and HTTPS.
+
+- name: Install Rust toolchain for control plane
+  become_user: "{{ wraith_user }}"
+  ansible.builtin.shell: |
+    set -euo pipefail
+    if [ ! -x "{{ wraith_cargo_bin }}" ]; then
+      curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain stable
+    fi
+  args:
+    executable: /bin/bash
+
+- name: Upload repository to control-plane host
+  ansible.builtin.copy:
+    src: "{{ wraith_repo_src }}/"
+    dest: "{{ wraith_install_dir }}/src/"
+    owner: "{{ wraith_user }}"
+    group: "{{ wraith_group }}"
+    mode: preserve
+
+- name: Build server binary
+  become_user: "{{ wraith_user }}"
+  ansible.builtin.command:
+    argv:
+      - "{{ wraith_cargo_bin }}"
+      - build
+      - --release
+      - -p
+      - "{{ wraith_control_plane_build_target }}"
+  args:
+    chdir: "{{ wraith_install_dir }}/src"
+  environment:
+    CARGO_HOME: "{{ wraith_cargo_home }}"
+    RUSTUP_HOME: "{{ wraith_rustup_root }}"
+
+- name: Install server binary
+  ansible.builtin.copy:
+    src: "{{ wraith_install_dir }}/src/target/release/server"
+    dest: "{{ wraith_install_dir }}/bin/server"
+    remote_src: true
+    owner: "{{ wraith_user }}"
+    group: "{{ wraith_group }}"
+    mode: "0755"
+  notify: Restart Wraith server
+
+- name: Write agent catalog
+  ansible.builtin.template:
+    src: agents.json.j2
+    dest: "{{ wraith_config_dir }}/agents.json"
+    owner: "{{ wraith_user }}"
+    group: "{{ wraith_group }}"
+    mode: "0640"
+  notify: Restart Wraith server
+
+- name: Write enrollment token store
+  ansible.builtin.template:
+    src: enrollment-tokens.json.j2
+    dest: "{{ wraith_config_dir }}/enrollment-tokens.json"
+    owner: "{{ wraith_user }}"
+    group: "{{ wraith_group }}"
+    mode: "0640"
+  notify: Restart Wraith server
+
+- name: Write OpenSSL SAN config
+  ansible.builtin.template:
+    src: openssl-server.cnf.j2
+    dest: "{{ wraith_cert_dir }}/openssl-server.cnf"
+    owner: root
+    group: "{{ wraith_group }}"
+    mode: "0640"
+  when: wraith_server_tls_mode == "self_signed"
+
+- name: Generate deployment CA private key
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - genrsa
+      - -out
+      - "{{ wraith_cert_dir }}/ca.key"
+      - "4096"
+  args:
+    creates: "{{ wraith_cert_dir }}/ca.key"
+  when: wraith_server_tls_mode == "self_signed"
+
+- name: Generate deployment CA certificate
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -x509
+      - -new
+      - -nodes
+      - -key
+      - "{{ wraith_cert_dir }}/ca.key"
+      - -sha256
+      - -days
+      - "{{ wraith_ca_validity_days | string }}"
+      - -out
+      - "{{ wraith_cert_dir }}/ca.crt"
+      - -subj
+      - "/CN={{ wraith_ca_common_name }}"
+  args:
+    creates: "{{ wraith_cert_dir }}/ca.crt"
+  when: wraith_server_tls_mode == "self_signed"
+
+- name: Generate server private key
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - genrsa
+      - -out
+      - "{{ wraith_cert_dir }}/server.key"
+      - "4096"
+  args:
+    creates: "{{ wraith_cert_dir }}/server.key"
+  when: wraith_server_tls_mode == "self_signed"
+
+- name: Generate server certificate signing request
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -new
+      - -key
+      - "{{ wraith_cert_dir }}/server.key"
+      - -out
+      - "{{ wraith_cert_dir }}/server.csr"
+      - -subj
+      - "/CN={{ wraith_tls_common_name }}"
+      - -config
+      - "{{ wraith_cert_dir }}/openssl-server.cnf"
+      - -reqexts
+      - v3_req
+  args:
+    creates: "{{ wraith_cert_dir }}/server.csr"
+  when: wraith_server_tls_mode == "self_signed"
+
+- name: Generate signed server certificate
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -req
+      - -in
+      - "{{ wraith_cert_dir }}/server.csr"
+      - -CA
+      - "{{ wraith_cert_dir }}/ca.crt"
+      - -CAkey
+      - "{{ wraith_cert_dir }}/ca.key"
+      - -CAcreateserial
+      - -out
+      - "{{ wraith_cert_dir }}/server.crt"
+      - -days
+      - "{{ wraith_server_cert_validity_days | string }}"
+      - -sha256
+      - -extfile
+      - "{{ wraith_cert_dir }}/openssl-server.cnf"
+      - -extensions
+      - v3_req
+  args:
+    creates: "{{ wraith_cert_dir }}/server.crt"
+  when: wraith_server_tls_mode == "self_signed"
+
+- name: Install provided CA certificate
+  ansible.builtin.copy:
+    src: "{{ wraith_provided_ca_cert_src }}"
+    dest: "{{ wraith_cert_dir }}/ca.crt"
+    owner: root
+    group: "{{ wraith_group }}"
+    mode: "0644"
+  when: wraith_server_tls_mode == "provided"
+  notify: Restart Wraith server
+
+- name: Install provided CA private key
+  ansible.builtin.copy:
+    src: "{{ wraith_provided_ca_key_src }}"
+    dest: "{{ wraith_cert_dir }}/ca.key"
+    owner: root
+    group: "{{ wraith_group }}"
+    mode: "0640"
+  when: wraith_server_tls_mode == "provided"
+  notify: Restart Wraith server
+
+- name: Install provided server certificate
+  ansible.builtin.copy:
+    src: "{{ wraith_provided_server_cert_src }}"
+    dest: "{{ wraith_cert_dir }}/server.crt"
+    owner: root
+    group: "{{ wraith_group }}"
+    mode: "0644"
+  when: wraith_server_tls_mode == "provided"
+  notify: Restart Wraith server
+
+- name: Install provided server private key
+  ansible.builtin.copy:
+    src: "{{ wraith_provided_server_key_src }}"
+    dest: "{{ wraith_cert_dir }}/server.key"
+    owner: root
+    group: "{{ wraith_group }}"
+    mode: "0640"
+  when: wraith_server_tls_mode == "provided"
+  notify: Restart Wraith server
+
+- name: Remove transient certificate request artifacts
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - "{{ wraith_cert_dir }}/server.csr"
+    - "{{ wraith_cert_dir }}/ca.srl"
+  when: wraith_server_tls_mode == "self_signed"
+
+- name: Fix certificate permissions
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    owner: root
+    group: "{{ wraith_group }}"
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ wraith_cert_dir }}/ca.crt", mode: "0644" }
+    - { path: "{{ wraith_cert_dir }}/server.crt", mode: "0644" }
+    - { path: "{{ wraith_cert_dir }}/ca.key", mode: "0640" }
+    - { path: "{{ wraith_cert_dir }}/server.key", mode: "0640" }
+
+- name: Install control-plane systemd unit
+  ansible.builtin.template:
+    src: wraith-server.service.j2
+    dest: /etc/systemd/system/wraith-server.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart Wraith server
+
+- name: Install control-plane environment file
+  ansible.builtin.template:
+    src: server.env.j2
+    dest: "{{ wraith_server_env_file }}"
+    owner: root
+    group: "{{ wraith_group }}"
+    mode: "0640"
+  notify: Restart Wraith server
+
+- name: Reset UFW to a clean state
+  ansible.builtin.command: ufw --force reset
+  changed_when: true
+
+- name: Set UFW default deny incoming
+  ansible.builtin.command: ufw default deny incoming
+  changed_when: true
+
+- name: Set UFW default allow outgoing
+  ansible.builtin.command: ufw default allow outgoing
+  changed_when: true
+
+- name: Allow SSH from approved CIDRs
+  ansible.builtin.command:
+    argv:
+      - ufw
+      - allow
+      - from
+      - "{{ item }}"
+      - to
+      - any
+      - port
+      - "22"
+      - proto
+      - tcp
+  loop: "{{ wraith_admin_ssh_cidrs }}"
+  changed_when: true
+
+- name: Allow WireGuard from approved CIDRs
+  ansible.builtin.command:
+    argv:
+      - ufw
+      - allow
+      - from
+      - "{{ item }}"
+      - to
+      - any
+      - port
+      - "{{ wraith_wireguard_listen_port | string }}"
+      - proto
+      - udp
+  loop: "{{ wraith_wireguard_allowed_cidrs }}"
+  when: wraith_wireguard_enabled
+  changed_when: true
+
+- name: Allow control-plane gRPC from approved CIDRs
+  ansible.builtin.command:
+    argv:
+      - ufw
+      - allow
+      - from
+      - "{{ item }}"
+      - to
+      - any
+      - port
+      - "50051"
+      - proto
+      - tcp
+  loop: "{{ wraith_control_plane_allowed_grpc_cidrs }}"
+  changed_when: true
+
+- name: Allow control-plane HTTPS from approved CIDRs
+  ansible.builtin.command:
+    argv:
+      - ufw
+      - allow
+      - from
+      - "{{ item }}"
+      - to
+      - any
+      - port
+      - "5443"
+      - proto
+      - tcp
+  loop: "{{ wraith_control_plane_allowed_https_cidrs }}"
+  changed_when: true
+
+- name: Enable UFW
+  ansible.builtin.command: ufw --force enable
+  changed_when: true
+
+- name: Enable and start control-plane service
+  ansible.builtin.systemd:
+    name: wraith-server.service
+    enabled: true
+    state: started

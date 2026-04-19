@@ -9,6 +9,7 @@ enum JobType {
   JOB_TYPE_HEALTH_CHECK = 1;
   JOB_TYPE_COLLECT_METRICS = 2;
   JOB_TYPE_FETCH_LOGS = 3;
+  JOB_TYPE_RUN_COMMAND = 4;
 }
 
 message SubmitJobRequest {
@@ -16,6 +17,8 @@ message SubmitJobRequest {
   JobType job_type = 2;
   uint32 log_lines = 3;
   string log_source = 4;
+  string command_id = 5;
+  repeated string command_args = 6;
 }
 
 message SubmitJobResponse {
@@ -24,6 +27,22 @@ message SubmitJobResponse {
   string status = 3;
   string summary = 4;
   string details_json = 5;
+}
+
+message JobWatchRequest {
+  string job_id = 1;
+}
+
+message JobUpdate {
+  string job_id = 1;
+  string agent_id = 2;
+  string status = 3;
+  string summary = 4;
+  string details_json = 5;
+  string submitted_at = 6;
+  string started_at = 7;
+  string completed_at = 8;
+  string action = 9;
 }
 
 message AgentSnapshot {
@@ -36,6 +55,8 @@ message AgentSnapshot {
   string status = 7;
   string last_seen = 8;
   repeated string capabilities = 9;
+  bool enabled = 10;
+  repeated string commands = 11;
 }
 
 message RecentJob {
@@ -46,6 +67,7 @@ message RecentJob {
   string status = 5;
   string submitted_at = 6;
   string summary = 7;
+  string details_json = 8;
 }
 
 message DashboardSnapshot {
@@ -57,4 +79,5 @@ message DashboardSnapshot {
 service Orchestrator {
   rpc GetDashboard(Empty) returns (DashboardSnapshot);
   rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+  rpc WatchJob(JobWatchRequest) returns (stream JobUpdate);
 }

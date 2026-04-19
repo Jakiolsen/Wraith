@@ -1,8 +1,38 @@
 {
-  "agent_id": "edge-eu-01",
+  "agent_id": "edge-eu-01-seed",
   "listen_addr": "127.0.0.1:8088",
+  "advertised_name": "Edge EU 01",
+  "environment": "production",
+  "location": "Copenhagen",
+  "advertised_base_url": "http://127.0.0.1:8088",
+  "control_plane_url": "https://127.0.0.1:5443",
+  "bootstrap_token": "replace-with-a-bootstrap-token-issued-by-the-operator-ui",
+  "state_path": "data/agent.state.json",
   "log_sources": {
     "application": "examples/application.log",
     "audit": "examples/audit.log"
-  }
+  },
+  "commands": [
+    {
+      "id": "uptime",
+      "description": "Show system uptime",
+      "kind": "shell_command",
+      "program": "uptime",
+      "args": [],
+      "supported_platforms": ["linux"],
+      "allow_args": false,
+      "timeout_seconds": 10,
+      "max_output_bytes": 4096
+    },
+    {
+      "id": "collect_example_log",
+      "description": "Collect the example application log",
+      "kind": "file_collection",
+      "base_directory": "examples",
+      "source_path": "application.log",
+      "allow_args": false,
+      "timeout_seconds": 10,
+      "max_output_bytes": 8192
+    }
+  ]
 }

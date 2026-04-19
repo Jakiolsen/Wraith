@@ -1,0 +1,15 @@
+[Interface]
+Address = {{ wraith_wireguard_server_address }}
+ListenPort = {{ wraith_wireguard_listen_port }}
+PrivateKey = {{ wraith_wireguard_server_private_key }}
+
+{% for peer in wraith_wireguard_peers %}
+[Peer]
+# {{ peer.name }}
+PublicKey = {{ peer.public_key }}
+{% if peer.preshared_key is defined and peer.preshared_key %}
+PresharedKey = {{ peer.preshared_key }}
+{% endif %}
+AllowedIPs = {{ peer.allowed_ips | join(', ') }}
+
+{% endfor %}

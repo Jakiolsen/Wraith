@@ -1,0 +1,9 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart Wraith server
+  ansible.builtin.systemd:
+    name: wraith-server.service
+    state: restarted

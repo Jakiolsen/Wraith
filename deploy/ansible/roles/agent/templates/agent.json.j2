@@ -1,0 +1,14 @@
+{
+  "agent_id": {{ wraith_agent_id | to_json }},
+  "listen_addr": {{ wraith_agent_listen_addr | to_json }},
+  "advertised_name": {{ wraith_agent_advertised_name | to_json }},
+  "environment": {{ wraith_agent_environment | to_json }},
+  "location": {{ wraith_agent_location | to_json }},
+  "advertised_base_url": {{ wraith_agent_advertised_base_url | to_json }},
+  "control_plane_url": {{ wraith_agent_control_plane_url | to_json }},
+  "bootstrap_token": {{ wraith_agent_bootstrap_token | to_json }},
+  "state_path": {{ wraith_agent_state_path | to_json }},
+  "auth_token": {{ wraith_agent_auth_token | to_json }},
+  "log_sources": {{ wraith_agent_log_sources | to_nice_json }},
+  "commands": {{ wraith_agent_commands | to_nice_json }}
+}

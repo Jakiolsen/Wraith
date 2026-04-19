@@ -16,6 +16,12 @@ pub struct AgentDescriptor {
     pub location: String,
     pub base_url: String,
     pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub command_ids: Vec<String>,
+    #[serde(default)]
+    pub redirector_token: Option<String>,
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,6 +54,7 @@ pub enum MaintenanceAction {
     HealthCheck,
     CollectMetrics,
     FetchLogs { source: LogSource, lines: usize },
+    RunCommand { command_id: String, args: Vec<String> },
 }
 
 impl MaintenanceAction {
@@ -57,6 +64,13 @@ impl MaintenanceAction {
             Self::CollectMetrics => "Collect Metrics".to_owned(),
             Self::FetchLogs { source, lines } => {
                 format!("Fetch {} Logs ({lines})", source.as_str())
+            }
+            Self::RunCommand { command_id, args } => {
+                if args.is_empty() {
+                    format!("Run Command ({command_id})")
+                } else {
+                    format!("Run Command ({command_id} {})", args.join(" "))
+                }
             }
         }
     }
@@ -77,6 +91,15 @@ impl MaintenanceAction {
                 Ok(Self::FetchLogs {
                     source,
                     lines: request.log_lines.max(10) as usize,
+                })
+            }
+            proto::JobType::RunCommand => {
+                if request.command_id.trim().is_empty() {
+                    anyhow::bail!("command_id is required");
+                }
+                Ok(Self::RunCommand {
+                    command_id: request.command_id.clone(),
+                    args: request.command_args.clone(),
                 })
             }
             proto::JobType::Unspecified => anyhow::bail!("job type is required"),
@@ -147,14 +170,154 @@ pub struct HealthPayload {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentRuntimeConfig {
+    #[serde(default)]
     pub agent_id: String,
     pub listen_addr: String,
     pub log_sources: HashMap<String, String>,
+    #[serde(default)]
+    pub advertised_name: Option<String>,
+    #[serde(default)]
+    pub environment: Option<String>,
+    #[serde(default)]
+    pub location: Option<String>,
+    #[serde(default)]
+    pub advertised_base_url: Option<String>,
+    #[serde(default)]
+    pub control_plane_url: Option<String>,
+    #[serde(default)]
+    pub bootstrap_token: Option<String>,
+    #[serde(default)]
+    pub state_path: Option<String>,
+    #[serde(default)]
+    pub commands: Vec<AgentCommandSpec>,
+    #[serde(default)]
+    pub auth_token: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentCommandSpec {
+    pub id: String,
+    pub description: String,
+    #[serde(default)]
+    pub kind: AgentCommandKind,
+    #[serde(default)]
+    pub supported_platforms: Vec<String>,
+    #[serde(default)]
+    pub arg_schema: Vec<AgentCommandArgSpec>,
+    #[serde(default = "default_command_concurrency_limit")]
+    pub concurrency_limit: usize,
+    #[serde(default)]
+    pub allow_args: bool,
+    #[serde(default)]
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub base_directory: Option<String>,
+    #[serde(default)]
+    pub source_path: Option<String>,
+    #[serde(default = "default_command_timeout_seconds")]
+    pub timeout_seconds: u64,
+    #[serde(default = "default_command_output_bytes")]
+    pub max_output_bytes: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentCommandKind {
+    #[default]
+    ShellCommand,
+    FileCollection,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentCommandArgSpec {
+    pub name: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub redacted: bool,
+    #[serde(default)]
+    pub allowed_values: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentRuntimeState {
+    pub agent_id: String,
+    pub management_token: String,
+    pub inbound_auth_token: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerCatalog {
     pub agents: Vec<AgentDescriptor>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentBootstrapTokenResponse {
+    pub token: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentRegistrationRequest {
+    pub bootstrap_token: String,
+    pub name: String,
+    pub environment: String,
+    pub location: String,
+    pub endpoint: String,
+    pub capabilities: Vec<String>,
+    pub commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentRegistrationResponse {
+    pub agent_id: String,
+    pub management_token: String,
+    pub inbound_auth_token: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentHeartbeatRequest {
+    pub agent_id: String,
+    pub management_token: String,
+    pub endpoint: String,
+    pub capabilities: Vec<String>,
+    pub commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentHeartbeatResponse {
+    pub accepted: bool,
+    pub enabled: bool,
+    pub inbound_auth_token: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentAdminRecord {
+    pub id: String,
+    pub name: String,
+    pub environment: String,
+    pub location: String,
+    pub endpoint: String,
+    pub enabled: bool,
+    pub status: String,
+    pub last_seen: String,
+    pub capabilities: Vec<String>,
+    pub commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AuditEventRecord {
+    pub created_at: String,
+    pub actor_username: Option<String>,
+    pub actor_role: Option<String>,
+    pub actor_client_id: Option<String>,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub success: bool,
+    pub details: serde_json::Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -176,10 +339,13 @@ pub struct EnrollmentRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnrollmentResponse {
-    pub client_id: String,
-    pub client_certificate_pem: String,
+    pub request_id: String,
+    pub status: String,
+    pub client_id: Option<String>,
+    pub client_certificate_pem: Option<String>,
     pub certificate_chain_pem: Vec<String>,
-    pub expires_at: String,
+    pub client_certificate_fingerprint: Option<String>,
+    pub expires_at: Option<String>,
     pub mtls_endpoint: String,
     pub enrollment_summary: String,
 }
@@ -203,6 +369,11 @@ pub struct EnrollmentTokenStore {
 pub struct LoginRequest {
     pub username: String,
     pub password: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LogoutRequest {
+    pub session_token: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -234,6 +405,9 @@ pub fn sample_catalog() -> ServerCatalog {
                 "collect_metrics".to_owned(),
                 "fetch_logs".to_owned(),
             ],
+            command_ids: vec!["uptime".to_owned()],
+            redirector_token: None,
+            auth_token: None,
         }],
     }
 }
@@ -259,4 +433,22 @@ pub fn validate_device_identity(device: &DeviceIdentity) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+pub fn sha256_hex_bytes(input: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    format!("{:x}", hasher.finalize())
+}
+
+fn default_command_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_command_output_bytes() -> usize {
+    16 * 1024
+}
+
+fn default_command_concurrency_limit() -> usize {
+    1
 }

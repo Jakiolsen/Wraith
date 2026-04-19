@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 serde.workspace = true
@@ -15,4 +16,5 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
+reqwest.workspace = true
 shared = { path = "../shared" }

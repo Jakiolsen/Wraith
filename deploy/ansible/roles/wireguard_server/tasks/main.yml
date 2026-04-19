@@ -1,0 +1,40 @@
+---
+- name: Skip WireGuard setup when disabled
+  ansible.builtin.meta: end_role
+  when: not wraith_wireguard_enabled
+
+- name: Validate WireGuard server configuration
+  ansible.builtin.assert:
+    that:
+      - wraith_wireguard_server_private_key | length > 0
+      - wraith_wireguard_peers | length > 0
+    fail_msg: WireGuard requires a server private key and at least one peer.
+
+- name: Install WireGuard
+  ansible.builtin.apt:
+    name: wireguard
+    state: present
+    update_cache: true
+
+- name: Create WireGuard config directory
+  ansible.builtin.file:
+    path: /etc/wireguard
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+- name: Install WireGuard server config
+  ansible.builtin.template:
+    src: wg0.conf.j2
+    dest: "/etc/wireguard/{{ wraith_wireguard_interface }}.conf"
+    owner: root
+    group: root
+    mode: "0600"
+  notify: Restart WireGuard
+
+- name: Enable and start WireGuard
+  ansible.builtin.systemd:
+    name: "wg-quick@{{ wraith_wireguard_interface }}"
+    enabled: true
+    state: started
