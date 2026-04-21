@@ -23,24 +23,40 @@ Operator Client ──gRPC──► C2 Server ◄──HTTP── (optional Redi
 
 ## Setup
 
+### Server (Docker — recommended)
+
+**Prerequisites:** Docker, Docker Compose, Rust + `protoc` (client only)
+
+```bash
+# 1. Write credentials into secret files (input is hidden, files are chmod 600)
+make docker-secrets
+
+# 2. Start Postgres + server
+make docker-up
+
+# 3. Provision the admin account (first time only)
+make docker-provision
+
+# 4. Build and run the operator client locally
+make client
+```
+
+Credentials are stored in `secrets/` as plain files mounted into containers at `/run/secrets/`.
+They are **never passed as environment variables** and never appear in `docker inspect` output.
+Postgres has no host port binding — it is unreachable from outside the Docker network.
+The server binds to `127.0.0.1` only; put a reverse proxy (nginx, Caddy) in front for remote access.
+
+### Server (manual — no Docker)
+
 **Prerequisites:** Rust (stable), PostgreSQL 14+, `protoc`
 
 ```bash
-# Create database and export connection string
 createdb wraith
 export DATABASE_URL=postgres://user:pass@localhost/wraith
 
-# Build everything
-make build
-
-# Provision admin account (first time only)
-make provision
-
-# Start server (terminal 1)
-make server
-
-# Start client (terminal 2)
-make client
+make provision   # first time only
+make server      # terminal 1
+make client      # terminal 2
 ```
 
 ---
@@ -155,6 +171,10 @@ make release    # release build
 Wraith/
 ├── Cargo.toml            workspace manifest
 ├── Makefile              task runner recipes
+├── docker-compose.yml
+├── docker/
+│   └── Dockerfile
+├── .env.example
 ├── proto/
 │   └── orchestrator.proto
 ├── shared/               wire types + protobuf generated code

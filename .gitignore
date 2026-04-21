@@ -2,28 +2,34 @@
 /target
 **/target
 
-# ── Secrets and credentials ───────────────────────────────────────────────────
+# ── Docker secrets — contain live credentials, never commit ──────────────────
+secrets/*
+!secrets/.gitkeep
+
+# ── Environment files ─────────────────────────────────────────────────────────
 .env
 .env.local
 .env.*.local
 
-# TLS / PKI material
+# ── TLS / PKI material ────────────────────────────────────────────────────────
 *.pem
 *.key
 *.crt
-*.csr
 *.csr
 *.srl
 *.p12
 *.pfx
 *.der
 
-# Other common secret files
+# ── Other credential patterns ─────────────────────────────────────────────────
 *.secret
 *_secret
-secrets/
-credentials/
 *.token
+credentials/
+
+# ── Rust / Cargo ──────────────────────────────────────────────────────────────
+Cargo.lock          # omit for libraries; keep for binaries — this repo has both,
+                    # so leaving it uncommitted avoids pinning implant builds
 
 # ── Database files ────────────────────────────────────────────────────────────
 data/
@@ -33,7 +39,7 @@ data/
 *.sqlite
 *.sqlite3
 
-# ── Editor and OS noise ───────────────────────────────────────────────────────
+# ── OS and editor noise ───────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 .idea/
@@ -41,3 +47,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# ── Logs and runtime state ────────────────────────────────────────────────────
+*.log
+logs/

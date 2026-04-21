@@ -1,0 +1,50 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: wraith
+      POSTGRES_USER: wraith
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    # No ports: — Postgres is unreachable from outside Docker
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wraith"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    secrets:
+      - postgres_password
+      - redirector_token
+    ports:
+      - "127.0.0.1:8080:8080"    # localhost only — put a reverse proxy in front for remote access
+      - "127.0.0.1:50051:50051"  # localhost only — operator client connects from the same machine
+    networks:
+      - internal
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password
+  redirector_token:
+    file: ./secrets/redirector_token
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  pgdata:
