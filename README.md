@@ -37,7 +37,7 @@ docker compose up -d
 docker compose exec server wraith-server provision-admin --username admin
 
 # 4. Start the operator client (runs locally, not in Docker)
-just client
+make client
 ```
 
 The server exposes:
@@ -48,27 +48,24 @@ The server exposes:
 
 ## Manual setup (no Docker)
 
-**Prerequisites:** Rust (stable), PostgreSQL 14+, `protoc`, `just`
+**Prerequisites:** Rust (stable), PostgreSQL 14+, `protoc`, `make` (already available on Linux/macOS)
 
 ```bash
-# Install the just task runner
-cargo install just
-
 # Create database and export connection string
 createdb wraith
 export DATABASE_URL=postgres://user:pass@localhost/wraith
 
 # Build everything
-just build
+make build
 
 # Provision admin account
-just provision
+make provision
 
 # Start server (separate terminal)
-just server
+make server
 
 # Start client (separate terminal)
-just client
+make client
 ```
 
 ---
@@ -77,13 +74,13 @@ just client
 
 Build for the current platform:
 ```bash
-just implant
+make implant
 ```
 
 Cross-compile:
 ```bash
-just implant-linux    # x86_64 musl static binary
-just implant-windows  # x86_64 Windows (requires mingw-w64)
+make implant-linux    # x86_64 musl static binary
+make implant-windows  # x86_64 Windows (requires mingw-w64)
 ```
 
 The implant binary accepts:
@@ -100,7 +97,7 @@ The implant binary accepts:
 The redirector is a thin HTTP proxy that sits in front of the server. Run it on a separate host to hide the true server IP from the target network.
 
 ```bash
-just redirector profile=profiles/examples/default-https.toml
+make redirector PROFILE=profiles/examples/default-https.toml
 ```
 
 Profile fields (TOML):
@@ -152,18 +149,18 @@ pub trait Module: Send + Sync {
 ## Development
 
 ```bash
-just build      # build all workspace crates
-just check      # type-check only (fast)
-just fmt        # format all code
-just release    # release build
+make build      # build all workspace crates
+make check      # type-check only (fast)
+make fmt        # format all code
+make release    # release build
 ```
 
 Docker helpers:
 ```bash
-just docker-up          # start postgres + server
-just docker-down        # stop and remove containers
-just docker-provision   # create admin account in running container
-just docker-logs        # tail server logs
+make docker-up          # start postgres + server
+make docker-down        # stop and remove containers
+make docker-provision   # create admin account in running container
+make docker-logs        # tail server logs
 ```
 
 ---
@@ -191,7 +188,7 @@ just docker-logs        # tail server logs
 ```
 Wraith/
 ├── Cargo.toml            workspace manifest
-├── Justfile              task runner recipes
+├── Makefile              task runner recipes
 ├── docker-compose.yml
 ├── docker/
 │   └── Dockerfile
