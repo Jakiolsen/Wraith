@@ -1,1548 +1,547 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Parser;
-use eframe::{egui, egui::Color32};
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
-use reqwest::Client as HttpClient;
-use shared::proto::orchestrator_client::OrchestratorClient;
-use shared::proto::{
-    DashboardSnapshot, Empty, JobType, JobUpdate, JobWatchRequest, SubmitJobRequest,
-    SubmitJobResponse,
-};
-use shared::{
-    AgentBootstrapTokenResponse, AuditEventRecord, DeviceIdentity, EnrollmentRequest,
-    EnrollmentResponse, LoginRequest, LoginResponse, LogoutRequest,
-};
-use std::fs;
-use std::path::{Path, PathBuf};
+use eframe::egui;
+use eframe::egui::Color32;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Runtime};
 use tonic::metadata::MetadataValue;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+use tonic::transport::Channel;
 
-#[derive(Parser, Debug, Clone)]
+use shared::{
+    proto::{
+        orchestrator_client::OrchestratorClient, Empty, SessionTasksRequest, TaskRequest,
+    },
+    LoginRequest, LoginResponse,
+};
+
+// ── colour palette ────────────────────────────────────────────────────────────
+const BG:         Color32 = Color32::from_rgb(6, 6, 8);
+const PANEL:      Color32 = Color32::from_rgb(10, 10, 14);
+const CARD:       Color32 = Color32::from_rgb(16, 16, 22);
+const BORDER:     Color32 = Color32::from_rgb(28, 28, 40);
+const ACCENT:     Color32 = Color32::from_rgb(196, 43, 62);
+const ACCENT_DIM: Color32 = Color32::from_rgb(100, 20, 32);
+const GREEN:      Color32 = Color32::from_rgb(60, 179, 113);
+const AMBER:      Color32 = Color32::from_rgb(210, 165, 50);
+const TEXT:       Color32 = Color32::from_rgb(232, 232, 236);
+const MUTED:      Color32 = Color32::from_rgb(120, 122, 140);
+
+// ── CLI ───────────────────────────────────────────────────────────────────────
+
+#[derive(Parser, Clone)]
 struct Args {
-    #[arg(long, default_value = "https://127.0.0.1:50051")]
-    endpoint: String,
-    #[arg(long, default_value = "https://127.0.0.1:5443")]
-    enrollment_endpoint: String,
-    #[arg(long, default_value = "localhost")]
-    domain_name: String,
-    #[arg(long, default_value = "certs/ca.crt")]
-    ca_cert: PathBuf,
-    #[arg(long, default_value = "certs/client.crt")]
-    client_cert: PathBuf,
-    #[arg(long, default_value = "certs/client.key")]
-    client_key: PathBuf,
-    #[arg(long, default_value = "certs/client.enrollment.json")]
-    pending_enrollment: PathBuf,
+    /// gRPC address of the server (for session/task management)
+    #[arg(long, default_value = "http://127.0.0.1:50051")]
+    grpc: String,
+    /// HTTP address of the server (for login)
+    #[arg(long, default_value = "http://127.0.0.1:8080")]
+    server: String,
 }
+
+// ── State ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Default)]
 struct UiState {
-    dashboard: Option<DashboardSnapshot>,
-    active_job: Option<JobUpdate>,
-    audit_events: Vec<AuditEventRecord>,
-    flash: Option<String>,
-    last_enrollment: Option<EnrollmentResponse>,
-    auth_session: Option<LoginResponse>,
-    enrolled: bool,
-    authenticated: bool,
-    pending_enrollment: bool,
+    auth:        Option<LoginResponse>,
+    flash:       Option<String>,
+    sessions:    Vec<shared::proto::SessionSnapshot>,
+    tasks:       Vec<shared::proto::TaskResult>,
     pending_login: bool,
-    pending_enrollment_request_id: Option<String>,
 }
 
-struct ClientApp {
-    runtime: Arc<Runtime>,
-    args: Args,
-    ui_state: Arc<RwLock<UiState>>,
-    current_view: AppView,
-    selected_agent: usize,
-    job_kind: JobSelection,
-    log_lines: u32,
-    command_args: String,
-    selected_command: String,
-    enrollment_token: String,
-    client_name: String,
-    validity_days: u32,
+struct App {
+    runtime:  Arc<Runtime>,
+    args:     Args,
+    state:    Arc<RwLock<UiState>>,
+    view:     View,
+    // login fields
     username: String,
     password: String,
+    // session fields
+    selected: Option<String>,
+    module:   String,
+    task_args: String,
     last_refresh: Instant,
-    auto_refresh_requested: bool,
 }
 
-#[derive(serde::Deserialize)]
-struct ApiError {
-    error: String,
-}
+#[derive(Clone, Copy, PartialEq)]
+enum View { Login, Sessions }
 
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct PendingEnrollmentState {
-    request_id: String,
-    private_key_pem: String,
-}
+// ── App logic ─────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AppView {
-    Start,
-    Main,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum JobSelection {
-    HealthCheck,
-    CollectMetrics,
-    FetchApplicationLogs,
-    FetchAuditLogs,
-    RunCommand,
-}
-
-impl JobSelection {
-    fn label(self) -> &'static str {
-        match self {
-            Self::HealthCheck => "Health Check",
-            Self::CollectMetrics => "Collect Metrics",
-            Self::FetchApplicationLogs => "Fetch App Logs",
-            Self::FetchAuditLogs => "Fetch Audit Logs",
-            Self::RunCommand => "Run Command",
-        }
-    }
-
-    fn job_type(self) -> i32 {
-        match self {
-            Self::HealthCheck => JobType::HealthCheck as i32,
-            Self::CollectMetrics => JobType::CollectMetrics as i32,
-            Self::FetchApplicationLogs | Self::FetchAuditLogs => JobType::FetchLogs as i32,
-            Self::RunCommand => JobType::RunCommand as i32,
-        }
-    }
-
-    fn log_source(self) -> &'static str {
-        match self {
-            Self::FetchAuditLogs => "audit",
-            _ => "application",
-        }
-    }
-}
-
-impl ClientApp {
+impl App {
     fn new(runtime: Arc<Runtime>, args: Args) -> Self {
-        let enrolled = args.client_cert.exists() && args.client_key.exists();
-        let pending = load_pending_enrollment(&args.pending_enrollment).ok().flatten();
         Self {
             runtime,
             args,
-            ui_state: Arc::new(RwLock::new(UiState {
-                enrolled,
-                pending_enrollment_request_id: pending.as_ref().map(|item| item.request_id.clone()),
-                flash: Some(if enrolled {
-                    "Device certificate found. Complete operator login to continue.".to_owned()
-                } else if pending.is_some() {
-                    "Enrollment request is pending certificate issuance.".to_owned()
-                } else {
-                    "No device certificate found. Complete certificate enrollment first.".to_owned()
-                }),
-                ..Default::default()
-            })),
-            current_view: AppView::Start,
-            selected_agent: 0,
-            job_kind: JobSelection::CollectMetrics,
-            log_lines: 80,
-            command_args: String::new(),
-            selected_command: String::new(),
-            enrollment_token: String::new(),
-            client_name: "wraith-operator".to_owned(),
-            validity_days: 30,
-            username: String::new(),
-            password: String::new(),
+            state:        Arc::new(RwLock::new(UiState::default())),
+            view:         View::Login,
+            username:     String::new(),
+            password:     String::new(),
+            selected:     None,
+            module:       "shell".into(),
+            task_args:    String::new(),
             last_refresh: Instant::now() - Duration::from_secs(10),
-            auto_refresh_requested: false,
         }
     }
 
-    fn configure_theme(ctx: &egui::Context) {
-        let mut visuals = egui::Visuals::dark();
-        visuals.override_text_color = Some(Color32::from_rgb(236, 236, 236));
-        visuals.panel_fill = Color32::from_rgb(7, 7, 9);
-        visuals.extreme_bg_color = Color32::from_rgb(10, 10, 12);
-        visuals.faint_bg_color = Color32::from_rgb(14, 14, 18);
-        visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(14, 14, 18);
-        visuals.widgets.inactive.bg_fill = Color32::from_rgb(18, 18, 22);
-        visuals.widgets.active.bg_fill = Color32::from_rgb(150, 20, 32);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(182, 28, 43);
-        visuals.selection.bg_fill = Color32::from_rgb(166, 24, 38);
-        visuals.window_fill = Color32::from_rgb(10, 10, 12);
-        ctx.set_visuals(visuals);
-
-        let mut style = (*ctx.style()).clone();
-        style.spacing.item_spacing = egui::vec2(10.0, 10.0);
-        style.spacing.button_padding = egui::vec2(14.0, 10.0);
-        style.visuals.window_corner_radius = 18.0.into();
-        style.visuals.widgets.noninteractive.corner_radius = 10.0.into();
-        style.visuals.widgets.inactive.corner_radius = 10.0.into();
-        style.visuals.widgets.active.corner_radius = 10.0.into();
-        style.visuals.widgets.hovered.corner_radius = 10.0.into();
-        ctx.set_style(style);
+    fn flash(&self, msg: impl Into<String>) {
+        self.state.write().unwrap().flash = Some(msg.into());
     }
 
-    fn set_flash(&self, message: impl Into<String>) {
-        self.ui_state.write().unwrap().flash = Some(message.into());
+    fn token(&self) -> Option<String> {
+        self.state.read().unwrap().auth.as_ref().map(|a| a.token.clone())
     }
 
-    fn can_enter_main(&self) -> bool {
-        let state = self.ui_state.read().unwrap();
-        state.enrolled && state.authenticated && state.auth_session.is_some()
-    }
-
-    fn sync_view_with_auth(&mut self) {
-        if self.can_enter_main() {
-            if self.current_view != AppView::Main {
-                self.current_view = AppView::Main;
-            }
-            if !self.auto_refresh_requested {
-                self.request_refresh();
-                self.auto_refresh_requested = true;
-            }
-        } else {
-            self.current_view = AppView::Start;
-            self.auto_refresh_requested = false;
-        }
-    }
-
-    fn request_refresh(&mut self) {
-        let (token, role) = {
-            let state = self.ui_state.read().unwrap();
-            if !(state.enrolled && state.authenticated) {
-                return;
-            }
-            (
-                state
-                    .auth_session
-                    .as_ref()
-                    .map(|session| session.session_token.clone()),
-                state
-                    .auth_session
-                    .as_ref()
-                    .map(|session| session.role.clone())
-                    .unwrap_or_default(),
-            )
-        };
-
-        let Some(token) = token else {
-            self.set_flash("No authenticated session available.");
-            return;
-        };
-
-        let args = self.args.clone();
-        let ui_state = self.ui_state.clone();
+    fn do_login(&self) {
+        let (username, password) = (self.username.clone(), self.password.clone());
+        let (server, state) = (self.args.server.clone(), self.state.clone());
+        self.state.write().unwrap().pending_login = true;
         self.runtime.spawn(async move {
-            match fetch_dashboard(&args, &token).await {
-                Ok(snapshot) => {
-                    let mut state = ui_state.write().unwrap();
-                    state.dashboard = Some(snapshot);
-                    state.flash = Some("Dashboard refreshed over gRPC mTLS.".to_owned());
+            match login(&server, &username, &password).await {
+                Ok(resp) => {
+                    let mut s = state.write().unwrap();
+                    s.flash = Some(format!("Logged in as {}", resp.username));
+                    s.auth  = Some(resp);
+                    s.pending_login = false;
                 }
-                Err(err) => {
-                    ui_state.write().unwrap().flash = Some(format!("Refresh failed: {err}"));
+                Err(e) => {
+                    let mut s = state.write().unwrap();
+                    s.flash = Some(format!("Login failed: {e}"));
+                    s.pending_login = false;
                 }
             }
-            if role == "admin" {
-                match fetch_audit(&args, &token).await {
-                    Ok(events) => ui_state.write().unwrap().audit_events = events,
-                    Err(err) => {
-                        ui_state.write().unwrap().flash =
-                            Some(format!("Audit refresh failed: {err}"));
+        });
+    }
+
+    fn do_refresh(&mut self) {
+        let Some(token) = self.token() else { return };
+        let (grpc, state) = (self.args.grpc.clone(), self.state.clone());
+        let selected = self.selected.clone();
+        self.runtime.spawn(async move {
+            match connect(&grpc).await {
+                Ok(mut client) => {
+                    if let Ok(resp) = client.list_sessions(auth_req(Empty {}, &token)).await {
+                        state.write().unwrap().sessions = resp.into_inner().sessions;
+                    }
+                    if let Some(sid) = selected {
+                        let req = auth_req(SessionTasksRequest { session_id: sid }, &token);
+                        if let Ok(resp) = client.list_session_tasks(req).await {
+                            state.write().unwrap().tasks = resp.into_inner().tasks;
+                        }
                     }
                 }
+                Err(e) => { state.write().unwrap().flash = Some(format!("Refresh failed: {e}")); }
             }
         });
         self.last_refresh = Instant::now();
     }
 
-    fn dispatch_selected_job(&self) {
-        let (dashboard, token) = {
-            let state = self.ui_state.read().unwrap();
-            (
-                state.dashboard.clone(),
-                state
-                    .auth_session
-                    .as_ref()
-                    .map(|session| session.session_token.clone()),
-            )
-        };
-        let Some(snapshot) = dashboard else {
-            self.set_flash("No dashboard data available yet.");
-            return;
-        };
-        let Some(token) = token else {
-            self.set_flash("No authenticated session available.");
-            return;
-        };
-        let Some(agent) = snapshot.agents.get(self.selected_agent) else {
-            self.set_flash("No agent selected.");
-            return;
-        };
+    fn do_dispatch(&self) {
+        let Some(sid) = self.selected.clone() else { self.flash("No session selected."); return };
+        let Some(token) = self.token()         else { self.flash("Not logged in."); return };
+        let (grpc, state) = (self.args.grpc.clone(), self.state.clone());
+        let args: Vec<String> = self.task_args.split_whitespace().map(str::to_owned).collect();
+        let req = TaskRequest { session_id: sid, module: self.module.clone(), args };
+        self.runtime.spawn(async move {
+            match connect(&grpc).await {
+                Ok(mut client) => {
+                    match client.task_session(auth_req(req, &token)).await {
+                        Ok(r)  => { state.write().unwrap().flash = Some(format!("Queued: {}", r.into_inner().task_id)); }
+                        Err(e) => { state.write().unwrap().flash = Some(format!("Dispatch failed: {e}")); }
+                    }
+                }
+                Err(e) => { state.write().unwrap().flash = Some(format!("Connect failed: {e}")); }
+            }
+        });
+    }
+}
 
-        let args = self.args.clone();
-        let ui_state = self.ui_state.clone();
-        let command_id = if self.job_kind == JobSelection::RunCommand {
-            self.selected_command.trim().to_owned()
+// ── Rendering ─────────────────────────────────────────────────────────────────
+
+fn configure_theme(ctx: &egui::Context) {
+    let mut v = egui::Visuals::dark();
+    v.override_text_color             = Some(TEXT);
+    v.panel_fill                      = PANEL;
+    v.extreme_bg_color                = BG;
+    v.faint_bg_color                  = CARD;
+    v.window_fill                     = CARD;
+    v.widgets.noninteractive.bg_fill  = CARD;
+    v.widgets.inactive.bg_fill        = Color32::from_rgb(20, 20, 28);
+    v.widgets.hovered.bg_fill         = Color32::from_rgb(30, 14, 20);
+    v.widgets.active.bg_fill          = ACCENT_DIM;
+    v.selection.bg_fill               = Color32::from_rgba_unmultiplied(196, 43, 62, 60);
+    v.window_stroke                   = egui::Stroke::new(1.0, BORDER);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
+    ctx.set_visuals(v);
+
+    let mut s = (*ctx.style()).clone();
+    s.spacing.item_spacing   = egui::vec2(8.0, 6.0);
+    s.spacing.button_padding = egui::vec2(14.0, 8.0);
+    ctx.set_style(s);
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        configure_theme(ctx);
+        ctx.request_repaint_after(Duration::from_millis(500));
+
+        // Transition Login → Sessions on successful auth
+        if self.view == View::Login {
+            if self.state.read().unwrap().auth.is_some() {
+                self.view = View::Sessions;
+                self.do_refresh();
+            }
+        }
+
+        // Auto-refresh sessions every 5 s
+        if self.view == View::Sessions && self.last_refresh.elapsed() > Duration::from_secs(5) {
+            self.do_refresh();
+        }
+
+        let state = self.state.read().unwrap().clone();
+
+        if self.view == View::Login {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::default().fill(BG))
+                .show(ctx, |ui| render_login(self, ui, &state));
         } else {
-            String::new()
-        };
-        let command_args = if self.job_kind == JobSelection::RunCommand {
-            parse_command_args(&self.command_args)
-        } else {
-            Vec::new()
-        };
-        let request = SubmitJobRequest {
-            agent_id: agent.id.clone(),
-            job_type: self.job_kind.job_type(),
-            log_lines: self.log_lines,
-            log_source: self.job_kind.log_source().to_owned(),
-            command_id,
-            command_args,
-        };
+            egui::SidePanel::left("nav")
+                .exact_width(175.0)
+                .resizable(false)
+                .frame(egui::Frame::default().fill(PANEL).stroke(egui::Stroke::new(1.0, BORDER)))
+                .show(ctx, |ui| render_sidebar(self, ui, &state));
+            egui::CentralPanel::default()
+                .frame(egui::Frame::default().fill(BG))
+                .show(ctx, |ui| render_sessions(self, ui, &state));
+        }
+    }
+}
 
-        self.runtime.spawn(async move {
-            match submit_job(&args, &token, request).await {
-                Ok(response) => {
-                    {
-                        let mut state = ui_state.write().unwrap();
-                        state.flash =
-                            Some(format!("{} [{}]", response.summary, response.status));
-                        state.active_job = None;
+fn render_login(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
+    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.add_space(60.0);
+        ui.vertical_centered(|ui| {
+            ui.set_max_width(420.0);
+            ui.label(egui::RichText::new("◈").size(44.0).color(ACCENT));
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("W R A I T H").size(32.0).extra_letter_spacing(6.0).strong().color(TEXT));
+            ui.label(egui::RichText::new("COMMAND & CONTROL").size(9.0).extra_letter_spacing(3.0).color(MUTED));
+            ui.add_space(28.0);
+
+            egui::Frame::new()
+                .fill(CARD)
+                .stroke(egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(196, 43, 62, 70)))
+                .corner_radius(12.0)
+                .inner_margin(egui::Margin::same(24))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+
+                    ui.label(egui::RichText::new("Username").size(11.0).color(MUTED));
+                    ui.add(egui::TextEdit::singleline(&mut app.username)
+                        .hint_text("admin")
+                        .desired_width(ui.available_width()));
+
+                    ui.add_space(6.0);
+                    ui.label(egui::RichText::new("Password").size(11.0).color(MUTED));
+                    let pw = ui.add(egui::TextEdit::singleline(&mut app.password)
+                        .password(true)
+                        .hint_text("password")
+                        .desired_width(ui.available_width()));
+                    let enter = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+
+                    ui.add_space(12.0);
+                    let w = ui.available_width();
+                    let btn = egui::Button::new(
+                        egui::RichText::new(if state.pending_login { "Authenticating…" } else { "Login" }).size(13.0)
+                    )
+                    .fill(ACCENT_DIM)
+                    .stroke(egui::Stroke::new(1.0, ACCENT))
+                    .corner_radius(6.0)
+                    .min_size(egui::vec2(w, 38.0));
+
+                    if (ui.add_enabled(!state.pending_login, btn).clicked() || enter) && !state.pending_login {
+                        app.do_login();
                     }
-                    if let Err(err) = watch_job_stream(&args, &token, &response.job_id, &ui_state).await {
-                        ui_state.write().unwrap().flash =
-                            Some(format!("Job watch failed: {err}"));
+
+                    if let Some(msg) = &state.flash {
+                        ui.add_space(10.0);
+                        egui::Frame::new()
+                            .fill(Color32::from_rgba_unmultiplied(196, 43, 62, 30))
+                            .corner_radius(6.0)
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(msg).size(11.0).color(Color32::from_rgb(220, 140, 150)));
+                            });
                     }
-                }
-                Err(err) => {
-                    ui_state.write().unwrap().flash =
-                        Some(format!("Dispatch failed: {err}"));
-                }
-            }
+                });
+        });
+    });
+}
+
+fn render_sidebar(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
+    ui.add_space(20.0);
+    ui.vertical_centered(|ui| {
+        ui.label(egui::RichText::new("◈").size(28.0).color(ACCENT));
+        ui.label(egui::RichText::new("WRAITH").size(14.0).extra_letter_spacing(3.0).strong().color(TEXT));
+        ui.label(egui::RichText::new("C2").size(9.0).extra_letter_spacing(2.0).color(MUTED));
+    });
+    ui.add_space(16.0);
+    ui.separator();
+    ui.add_space(10.0);
+
+    nav_item(ui, "◈", "Sessions", true);
+
+    // Bottom: user + lock
+    let h = ui.available_height();
+    ui.add_space((h - 60.0).max(8.0));
+    ui.separator();
+    ui.add_space(8.0);
+    if let Some(a) = &state.auth {
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new(&a.username).size(11.0).color(TEXT));
+            ui.label(egui::RichText::new(&a.role).size(10.0).color(MUTED));
         });
     }
-
-    fn issue_bootstrap_token(&self) {
-        let token = self
-            .ui_state
-            .read()
-            .unwrap()
-            .auth_session
-            .as_ref()
-            .map(|session| session.session_token.clone());
-        let Some(token) = token else {
-            self.set_flash("No authenticated session available.");
-            return;
-        };
-        let args = self.args.clone();
-        let ui_state = self.ui_state.clone();
-        self.runtime.spawn(async move {
-            let message = match issue_bootstrap_token(&args, &token).await {
-                Ok(response) => format!(
-                    "Bootstrap token: {} (expires {})",
-                    response.token, response.expires_at
-                ),
-                Err(err) => format!("Token issuance failed: {err}"),
-            };
-            ui_state.write().unwrap().flash = Some(message);
-        });
-    }
-
-    fn disable_selected_agent(&self) {
-        let (agent_id, token) = {
-            let state = self.ui_state.read().unwrap();
-            let agent_id = state
-                .dashboard
-                .as_ref()
-                .and_then(|snapshot| snapshot.agents.get(self.selected_agent))
-                .map(|agent| agent.id.clone());
-            let token = state
-                .auth_session
-                .as_ref()
-                .map(|session| session.session_token.clone());
-            (agent_id, token)
-        };
-        let (Some(agent_id), Some(token)) = (agent_id, token) else {
-            self.set_flash("No agent selected.");
-            return;
-        };
-
-        let args = self.args.clone();
-        let ui_state = self.ui_state.clone();
-        self.runtime.spawn(async move {
-            let message = match disable_agent(&args, &token, &agent_id).await {
-                Ok(()) => format!("Agent {agent_id} disabled"),
-                Err(err) => format!("Disable failed: {err}"),
-            };
-            ui_state.write().unwrap().flash = Some(message);
-        });
-    }
-
-    fn rotate_selected_agent_token(&self) {
-        let (agent_id, token) = {
-            let state = self.ui_state.read().unwrap();
-            let agent_id = state
-                .dashboard
-                .as_ref()
-                .and_then(|snapshot| snapshot.agents.get(self.selected_agent))
-                .map(|agent| agent.id.clone());
-            let token = state
-                .auth_session
-                .as_ref()
-                .map(|session| session.session_token.clone());
-            (agent_id, token)
-        };
-        let (Some(agent_id), Some(token)) = (agent_id, token) else {
-            self.set_flash("No agent selected.");
-            return;
-        };
-
-        let args = self.args.clone();
-        let ui_state = self.ui_state.clone();
-        self.runtime.spawn(async move {
-            let message = match rotate_agent_token(&args, &token, &agent_id).await {
-                Ok(response) => format!("New inbound token for {agent_id}: {}", response.token),
-                Err(err) => format!("Rotate failed: {err}"),
-            };
-            ui_state.write().unwrap().flash = Some(message);
-        });
-    }
-
-    fn enroll_device(&self) {
-        let args = self.args.clone();
-        let ui_state = self.ui_state.clone();
-        let token = self.enrollment_token.trim().to_owned();
-        let client_name = self.client_name.trim().to_owned();
-        let validity_days = self.validity_days;
-
+    ui.add_space(6.0);
+    ui.vertical_centered(|ui| {
+        if ui.add(egui::Button::new(egui::RichText::new("Lock").size(11.0).color(MUTED))
+            .fill(Color32::from_rgb(18, 18, 26))
+            .stroke(egui::Stroke::new(1.0, BORDER))).clicked()
         {
-            let mut state = self.ui_state.write().unwrap();
-            state.pending_enrollment = true;
-            state.flash = Some("Submitting certificate enrollment...".to_owned());
+            let mut s = app.state.write().unwrap();
+            s.auth = None;
+            s.sessions.clear();
+            s.tasks.clear();
+            drop(s);
+            app.view = View::Login;
         }
-        self.runtime.spawn(async move {
-            match enroll(&args, &token, &client_name, validity_days).await {
-                Ok((response, pending)) => {
-                    let mut state = ui_state.write().unwrap();
-                    state.pending_enrollment = false;
-                    state.last_enrollment = Some(response.clone());
-                    state.pending_enrollment_request_id =
-                        pending.as_ref().map(|item| item.request_id.clone());
-                    if response.status == "issued" {
-                        state.enrolled = true;
-                        state.pending_enrollment_request_id = None;
-                        state.flash = Some(format!(
-                            "Certificate enrollment complete for {}",
-                            response
-                                .client_id
-                                .clone()
-                                .unwrap_or_else(|| "unknown-client".to_owned())
-                        ));
-                    } else {
-                        state.enrolled = false;
-                        state.flash = Some(format!(
-                            "Enrollment request {} is pending offline CA approval.",
-                            response.request_id
-                        ));
-                    }
-                }
-                Err(err) => {
-                    let mut state = ui_state.write().unwrap();
-                    state.pending_enrollment = false;
-                    state.flash = Some(format!("Enrollment failed: {err}"));
-                }
-            }
-        });
-    }
+    });
+}
 
-    fn check_pending_enrollment(&self) {
-        let args = self.args.clone();
-        let ui_state = self.ui_state.clone();
-        {
-            let mut state = self.ui_state.write().unwrap();
-            state.pending_enrollment = true;
-            state.flash = Some("Checking pending enrollment status...".to_owned());
-        }
-        self.runtime.spawn(async move {
-            let request_id = load_pending_enrollment(&args.pending_enrollment)
-                .ok()
-                .flatten()
-                .map(|item| item.request_id);
-
-            let Some(request_id) = request_id else {
-                let mut state = ui_state.write().unwrap();
-                state.pending_enrollment = false;
-                state.pending_enrollment_request_id = None;
-                state.flash = Some("No pending enrollment request found.".to_owned());
-                return;
-            };
-
-            match fetch_enrollment_status(&args, &request_id).await {
-                Ok(response) => {
-                    let mut state = ui_state.write().unwrap();
-                    state.pending_enrollment = false;
-                    state.last_enrollment = Some(response.clone());
-                    if response.status == "issued" {
-                        state.enrolled = true;
-                        state.pending_enrollment_request_id = None;
-                        state.flash = Some(format!(
-                            "Certificate enrollment complete for {}",
-                            response
-                                .client_id
-                                .clone()
-                                .unwrap_or_else(|| "unknown-client".to_owned())
-                        ));
-                    } else {
-                        state.pending_enrollment_request_id = Some(response.request_id.clone());
-                        state.flash = Some(format!(
-                            "Enrollment request {} is still pending.",
-                            response.request_id
-                        ));
-                    }
-                }
-                Err(err) => {
-                    let mut state = ui_state.write().unwrap();
-                    state.pending_enrollment = false;
-                    state.flash = Some(format!("Enrollment status check failed: {err}"));
-                }
-            }
-        });
-    }
-
-    fn login_operator(&self) {
-        let username = self.username.trim().to_owned();
-        let password = self.password.clone();
-        if username.is_empty() || password.is_empty() {
-            self.set_flash("Username and password are required.");
-            return;
-        }
-
-        let args = self.args.clone();
-        let ui_state = self.ui_state.clone();
-        {
-            let mut state = self.ui_state.write().unwrap();
-            state.pending_login = true;
-            state.flash = Some("Submitting username/password login...".to_owned());
-        }
-        self.runtime.spawn(async move {
-            match login(&args, &username, &password).await {
-                Ok(response) => {
-                    let mut state = ui_state.write().unwrap();
-                    state.pending_login = false;
-                    state.authenticated = true;
-                    state.auth_session = Some(response.clone());
-                    state.flash = Some(format!("Authenticated as {}", response.username));
-                }
-                Err(err) => {
-                    let mut state = ui_state.write().unwrap();
-                    state.pending_login = false;
-                    state.authenticated = false;
-                    state.auth_session = None;
-                    state.flash = Some(format!("Login failed: {err}"));
-                }
-            }
-        });
-    }
-
-    fn logout(&mut self) {
-        let token = self
-            .ui_state
-            .read()
-            .unwrap()
-            .auth_session
-            .as_ref()
-            .map(|session| session.session_token.clone());
-        if let Some(token) = token {
-            let args = self.args.clone();
-            self.runtime.spawn(async move {
-                let _ = logout_remote(&args, &token).await;
+fn nav_item(ui: &mut egui::Ui, icon: &str, label: &str, active: bool) {
+    let fill = if active { Color32::from_rgba_unmultiplied(196, 43, 62, 35) } else { Color32::TRANSPARENT };
+    egui::Frame::new().fill(fill).corner_radius(6.0)
+        .inner_margin(egui::Margin { left: 14, right: 8, top: 7, bottom: 7 })
+        .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(icon).color(if active { ACCENT } else { MUTED }).size(12.0));
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(label).color(if active { TEXT } else { MUTED }).size(12.0));
             });
-        }
-        let mut state = self.ui_state.write().unwrap();
-        state.authenticated = false;
-        state.auth_session = None;
-        state.dashboard = None;
-        state.active_job = None;
-        state.flash = Some("Operator session cleared.".to_owned());
-        drop(state);
-        self.password.clear();
-        self.current_view = AppView::Start;
-        self.auto_refresh_requested = false;
-    }
+        });
+}
 
-    fn status_pill(ui: &mut egui::Ui, label: &str, active: bool) {
-        let fill = if active {
-            Color32::from_rgb(110, 18, 29)
-        } else {
-            Color32::from_rgb(34, 12, 16)
-        };
-        let text = if active { "Ready" } else { "Pending" };
-        egui::Frame::new()
-            .fill(fill)
-            .corner_radius(999.0)
-            .inner_margin(egui::Margin::symmetric(10, 6))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(label).strong());
-                    ui.label("·");
-                    ui.label(text);
+fn render_sessions(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
+    // Header
+    egui::Frame::new().fill(PANEL)
+        .inner_margin(egui::Margin { left: 20, right: 20, top: 14, bottom: 14 })
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("IMPLANT SESSIONS").size(12.0).extra_letter_spacing(2.0).strong().color(TEXT));
+                ui.add_space(10.0);
+                let active = state.sessions.iter().filter(|s| s.active).count();
+                ui.label(egui::RichText::new(format!("{active} active / {} total", state.sessions.len())).color(MUTED).size(11.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(egui::Button::new(egui::RichText::new("Refresh").size(11.0).color(MUTED))
+                        .fill(Color32::from_rgb(18, 18, 26))
+                        .stroke(egui::Stroke::new(1.0, BORDER))).clicked()
+                    {
+                        app.do_refresh();
+                    }
                 });
             });
-    }
+        });
 
-    fn render_start_view(&mut self, ui: &mut egui::Ui, state: &UiState) {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
+    ui.add(egui::Separator::default().horizontal().spacing(0.0));
+
+    let total_h = ui.available_height();
+    let console_h = if app.selected.is_some() { 240.0 } else { 0.0 };
+
+    // Session table
+    egui::ScrollArea::vertical().id_salt("sess").max_height(total_h - console_h - 2.0)
+        .auto_shrink([false, false]).show(ui, |ui| {
+        ui.add_space(6.0);
+        if state.sessions.is_empty() {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.label(egui::RichText::new("No active sessions").color(Color32::from_rgb(50, 52, 70)));
+                ui.label(egui::RichText::new("Deploy an implant to get started").size(11.0).color(Color32::from_rgb(35, 37, 55)));
+            });
+            return;
+        }
+
+        // Column headers
+        egui::Frame::new().fill(Color32::from_rgb(12, 12, 18))
+            .inner_margin(egui::Margin { left: 20, right: 20, top: 5, bottom: 5 })
             .show(ui, |ui| {
-                ui.add_space(20.0);
-                ui.vertical_centered(|ui| {
-                    ui.set_max_width(520.0);
-                    ui.label(
-                        egui::RichText::new("WRAITH")
-                            .size(15.0)
-                            .extra_letter_spacing(6.0)
-                            .color(Color32::from_rgb(188, 32, 46)),
-                    );
-                    ui.add_space(14.0);
-                    ui.heading(
-                        egui::RichText::new("Operator Login")
-                            .size(30.0)
-                            .color(Color32::from_rgb(242, 242, 242)),
-                    );
-                    ui.add_space(8.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Certificate identity and operator credentials are both required.",
-                        )
-                        .color(Color32::from_rgb(156, 156, 162)),
-                    );
-                    ui.add_space(16.0);
-                    ui.horizontal_wrapped(|ui| {
-                        Self::status_pill(ui, "Device certificate", state.enrolled);
-                        Self::status_pill(ui, "Operator login", state.authenticated);
+                egui::Grid::new("hdr").num_columns(6).spacing([16.0, 0.0]).show(ui, |ui| {
+                    for h in ["", "HOSTNAME", "USER", "OS / ARCH", "IP", "LAST SEEN"] {
+                        ui.label(egui::RichText::new(h).size(9.0).extra_letter_spacing(1.0).color(Color32::from_rgb(70, 72, 90)));
+                    }
+                    ui.end_row();
+                });
+            });
+
+        for s in &state.sessions {
+            let sel = app.selected.as_deref() == Some(&s.session_id);
+            let resp = egui::Frame::new()
+                .fill(if sel { Color32::from_rgba_unmultiplied(196, 43, 62, 22) } else { Color32::TRANSPARENT })
+                .stroke(if sel { egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(196, 43, 62, 80)) } else { egui::Stroke::NONE })
+                .inner_margin(egui::Margin { left: 20, right: 20, top: 7, bottom: 7 })
+                .show(ui, |ui| {
+                    egui::Grid::new(format!("r{}", s.session_id)).num_columns(6).spacing([16.0, 0.0]).show(ui, |ui| {
+                        let dot = if s.active { GREEN } else { MUTED };
+                        ui.colored_label(dot, if s.active { "●" } else { "○" });
+                        ui.label(egui::RichText::new(&s.hostname).strong().color(if sel { TEXT } else { Color32::from_rgb(200, 200, 210) }));
+                        ui.label(egui::RichText::new(&s.username).color(MUTED).size(12.0));
+                        ui.label(egui::RichText::new(format!("{} / {}", s.os, s.arch)).color(MUTED).size(12.0));
+                        ui.label(egui::RichText::new(&s.internal_ip).color(MUTED).size(12.0).monospace());
+                        ui.label(egui::RichText::new(&s.last_seen).color(Color32::from_rgb(60, 62, 80)).size(10.0));
+                        ui.end_row();
                     });
-                    ui.add_space(18.0);
+                });
 
-                    egui::Frame::new()
-                        .fill(Color32::from_rgba_unmultiplied(12, 12, 15, 245))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            Color32::from_rgba_unmultiplied(190, 24, 40, 90),
-                        ))
-                        .corner_radius(18.0)
-                        .inner_margin(egui::Margin::same(20))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
+            let id = ui.id().with(format!("r{}", s.session_id));
+            if ui.interact(resp.response.rect, id, egui::Sense::click()).clicked() {
+                app.selected = Some(s.session_id.clone());
+                app.do_refresh();
+            }
+            ui.add(egui::Separator::default().horizontal().spacing(0.0));
+        }
+    });
 
-                            ui.label(
-                                egui::RichText::new("Certificate")
-                                    .strong()
-                                    .color(Color32::from_rgb(192, 36, 51)),
-                            );
-                            ui.small(if state.enrolled {
-                                "A client certificate is already present on this workstation."
-                            } else {
-                                "Enroll this workstation if no client certificate is present."
-                            });
-                            ui.add_space(8.0);
-                            ui.label("Enrollment token");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.enrollment_token)
-                                    .hint_text("wraith-enrollment-dev-2026"),
-                            );
-                            ui.label("Client name");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.client_name)
-                                    .hint_text("wraith-operator"),
-                            );
-                            ui.add(
-                                egui::Slider::new(&mut self.validity_days, 1..=90)
-                                    .text("Validity days"),
-                            );
-                            if ui
-                                .add_enabled(
-                                    !state.enrolled && !state.pending_enrollment,
-                                    egui::Button::new(if state.pending_enrollment {
-                                        "Enrolling..."
-                                    } else {
-                                        "Enroll Device"
-                                    }),
-                                )
-                                .clicked()
-                            {
-                                self.enroll_device();
-                            }
-                            if ui
-                                .add_enabled(
-                                    state.pending_enrollment_request_id.is_some()
-                                        && !state.pending_enrollment,
-                                    egui::Button::new("Check Pending Enrollment"),
-                                )
-                                .clicked()
-                            {
-                                self.check_pending_enrollment();
-                            }
-                            if let Some(enrollment) = &state.last_enrollment {
-                                ui.add_space(6.0);
-                                ui.small(format!("Request ID: {}", enrollment.request_id));
-                                if let Some(client_id) = &enrollment.client_id {
-                                    ui.small(format!("Client ID: {}", client_id));
-                                }
-                                if let Some(expires_at) = &enrollment.expires_at {
-                                    ui.small(format!("Expires: {}", expires_at));
-                                }
-                                ui.small(format!("Status: {}", enrollment.status));
-                            }
+    // Task console
+    if app.selected.is_some() {
+        ui.add(egui::Separator::default().horizontal().spacing(0.0));
+        render_console(app, ui, state);
+    }
+}
 
-                            ui.add_space(18.0);
-                            ui.separator();
-                            ui.add_space(12.0);
+fn render_console(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
+    egui::Frame::new().fill(Color32::from_rgb(8, 8, 12))
+        .inner_margin(egui::Margin { left: 20, right: 20, top: 10, bottom: 10 })
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("TASK CONSOLE").size(9.0).extra_letter_spacing(2.0).color(Color32::from_rgb(70, 72, 90)));
+            ui.add_space(6.0);
 
-                            ui.label(
-                                egui::RichText::new("Credentials")
-                                    .strong()
-                                    .color(Color32::from_rgb(192, 36, 51)),
-                            );
-                            ui.small("Authenticate this workstation to an operator account.");
-                            ui.add_space(8.0);
-                            ui.label("Username");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.username).hint_text("admin"),
-                            );
-                            ui.label("Password");
-                            let password_edit = egui::TextEdit::singleline(&mut self.password)
-                                .password(true)
-                                .hint_text("Enter operator password");
-                            let response = ui.add(password_edit);
-                            let submit_with_enter = response.lost_focus()
-                                && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                            if (ui
-                                .add_enabled(
-                                    !state.pending_login,
-                                    egui::Button::new(if state.pending_login {
-                                        "Authenticating..."
-                                    } else {
-                                        "Authenticate"
-                                    }),
-                                )
-                                .clicked()
-                                || submit_with_enter)
-                                && !state.pending_login
-                            {
-                                self.login_operator();
-                            }
-                            if let Some(session) = &state.auth_session {
-                                ui.add_space(6.0);
-                                ui.small(format!("Signed in as: {}", session.username));
-                                ui.small(format!("Role: {}", session.role));
-                                ui.small(format!("Session expires: {}", session.expires_at));
-                            }
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("module").color(MUTED).size(11.0));
+                egui::ComboBox::from_id_salt("mod").width(90.0)
+                    .selected_text(egui::RichText::new(&app.module).size(12.0).color(TEXT))
+                    .show_ui(ui, |ui| {
+                        for m in ["shell","file_get","file_put","proc_list","sysinfo"] {
+                            ui.selectable_value(&mut app.module, m.into(), m);
+                        }
+                    });
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("args").color(MUTED).size(11.0));
+                ui.add(egui::TextEdit::singleline(&mut app.task_args)
+                    .hint_text(match app.module.as_str() { "shell" => "whoami", "file_get" => "/path/to/file", _ => "" })
+                    .desired_width(220.0)
+                    .font(egui::TextStyle::Monospace));
+                ui.add_space(6.0);
+                if ui.add(egui::Button::new(egui::RichText::new("Dispatch").size(12.0).color(TEXT))
+                    .fill(ACCENT_DIM).stroke(egui::Stroke::new(1.0, ACCENT)).corner_radius(6.0)).clicked()
+                {
+                    app.do_dispatch();
+                }
 
-                            if let Some(message) = &state.flash {
-                                ui.add_space(14.0);
-                                egui::Frame::new()
-                                    .fill(Color32::from_rgba_unmultiplied(120, 16, 29, 44))
-                                    .corner_radius(12.0)
-                                    .inner_margin(egui::Margin::same(14))
+                // flash inline
+                if let Some(msg) = &state.flash {
+                    ui.add_space(8.0);
+                    ui.label(egui::RichText::new(msg).size(11.0).color(Color32::from_rgb(180, 140, 150)));
+                }
+            });
+
+            ui.add_space(6.0);
+
+            egui::ScrollArea::vertical().id_salt("out").max_height(130.0)
+                .stick_to_bottom(true).auto_shrink([false, false]).show(ui, |ui| {
+                    for t in state.tasks.iter().rev().take(30) {
+                        let (sym, col) = match t.status.as_str() {
+                            "completed" => ("✓", GREEN),
+                            "failed"    => ("✗", Color32::from_rgb(210, 70, 70)),
+                            "sent"      => ("…", AMBER),
+                            _           => ("·", MUTED),
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            ui.colored_label(col, sym);
+                            ui.label(egui::RichText::new(&t.module).color(ACCENT).size(11.0).monospace());
+                            if !t.args.is_empty() {
+                                ui.label(egui::RichText::new(t.args.join(" ")).color(MUTED).size(11.0).monospace());
+                            }
+                        });
+                        if !t.output_json.is_empty() {
+                            let out = pretty_output(&t.output_json);
+                            if !out.is_empty() {
+                                egui::Frame::new().fill(Color32::from_rgb(11, 11, 16)).corner_radius(3.0)
+                                    .inner_margin(egui::Margin::same(6))
                                     .show(ui, |ui| {
-                                        ui.colored_label(Color32::from_rgb(228, 151, 159), message);
+                                        ui.label(egui::RichText::new(&out).size(11.0).color(Color32::from_rgb(170, 210, 170)).monospace());
                                     });
                             }
-                        });
+                        }
+                    }
+                    if state.tasks.is_empty() {
+                        ui.label(egui::RichText::new("No tasks yet.").size(11.0).color(Color32::from_rgb(45, 47, 65)));
+                    }
                 });
-                ui.add_space(20.0);
-            });
-    }
-
-    fn render_main_view(&mut self, ui: &mut egui::Ui, state: &UiState) {
-        let role = state
-            .auth_session
-            .as_ref()
-            .map(|session| session.role.as_str())
-            .unwrap_or("viewer");
-        let can_submit = matches!(role, "operator" | "admin");
-        let can_admin = role == "admin";
-        ui.horizontal(|ui| {
-            ui.label("Main Page");
-            if ui.button("Refresh Dashboard").clicked() {
-                self.request_refresh();
-            }
-            if ui.button("Lock").clicked() {
-                self.logout();
-            }
         });
-        ui.add_space(10.0);
-
-        let online = state
-            .dashboard
-            .as_ref()
-            .map(|snapshot| snapshot.agents.iter().filter(|agent| agent.online).count())
-            .unwrap_or(0);
-
-        ui.columns(2, |columns| {
-            columns[0].group(|ui| {
-                ui.heading("Fleet");
-                let agent_count = state
-                    .dashboard
-                    .as_ref()
-                    .map(|snapshot| snapshot.agents.len())
-                    .unwrap_or(0);
-                ui.label(format!("{agent_count} agents visible"));
-                ui.label(format!("{online} agents online"));
-                ui.separator();
-
-                if let Some(snapshot) = &state.dashboard {
-                    for (index, agent) in snapshot.agents.iter().enumerate() {
-                        let selected = self.selected_agent == index;
-                        let tone = if agent.online {
-                            Color32::from_rgb(186, 44, 58)
-                        } else {
-                            Color32::from_rgb(111, 46, 52)
-                        };
-                        let card = egui::Frame::new()
-                            .fill(if selected {
-                                Color32::from_rgb(28, 12, 16)
-                            } else {
-                                Color32::from_rgb(14, 14, 17)
-                            })
-                            .stroke(egui::Stroke::new(
-                                1.0,
-                                if selected {
-                                    Color32::from_rgb(150, 20, 32)
-                                } else {
-                                    Color32::from_rgb(24, 24, 28)
-                                },
-                            ))
-                            .corner_radius(10.0)
-                            .inner_margin(egui::Margin::same(12));
-                        card.show(ui, |ui| {
-                            if ui
-                                .selectable_label(
-                                    selected,
-                                    format!("{} · {}", agent.name, agent.location),
-                                )
-                                .clicked()
-                            {
-                                self.selected_agent = index;
-                            }
-                            ui.colored_label(tone, &agent.status);
-                            ui.small(format!("{} · {}", agent.environment, agent.endpoint));
-                        });
-                        ui.add_space(6.0);
-                    }
-                } else {
-                    ui.label("No dashboard data yet.");
-                }
-            });
-
-            columns[1].group(|ui| {
-                ui.heading("Operations");
-                if let Some(snapshot) = &state.dashboard {
-                    if let Some(agent) = snapshot.agents.get(self.selected_agent) {
-                        ui.label(format!("Target: {}", agent.name));
-                    }
-                }
-
-                egui::ComboBox::from_label("Job")
-                    .selected_text(self.job_kind.label())
-                    .show_ui(ui, |ui| {
-                        for job in [
-                            JobSelection::HealthCheck,
-                            JobSelection::CollectMetrics,
-                            JobSelection::FetchApplicationLogs,
-                            JobSelection::FetchAuditLogs,
-                            JobSelection::RunCommand,
-                        ] {
-                            ui.selectable_value(&mut self.job_kind, job, job.label());
-                        }
-                    });
-                if self.job_kind == JobSelection::RunCommand {
-                    let commands = snapshot_commands(state, self.selected_agent);
-                    if self.selected_command.is_empty() {
-                        if let Some(first) = commands.first() {
-                            self.selected_command = first.clone();
-                        }
-                    }
-                    egui::ComboBox::from_label("Command")
-                        .selected_text(if self.selected_command.is_empty() {
-                            "Select command"
-                        } else {
-                            &self.selected_command
-                        })
-                        .show_ui(ui, |ui| {
-                            for command in commands {
-                                ui.selectable_value(
-                                    &mut self.selected_command,
-                                    command.clone(),
-                                    command,
-                                );
-                            }
-                        });
-                    ui.label("Arguments");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.command_args)
-                            .hint_text("--verbose /var/log/app.log"),
-                    );
-                } else {
-                    ui.add(egui::Slider::new(&mut self.log_lines, 20..=400).text("Log lines"));
-                }
-                if ui
-                    .add_enabled(can_submit, egui::Button::new("Launch Job"))
-                    .clicked()
-                {
-                    self.dispatch_selected_job();
-                }
-
-                ui.separator();
-                ui.label(egui::RichText::new("Agent Management").strong());
-                if ui
-                    .add_enabled(can_admin, egui::Button::new("Issue Bootstrap Token"))
-                    .clicked()
-                {
-                    self.issue_bootstrap_token();
-                }
-                if ui
-                    .add_enabled(can_admin, egui::Button::new("Disable Selected Agent"))
-                    .clicked()
-                {
-                    self.disable_selected_agent();
-                }
-                if ui
-                    .add_enabled(can_admin, egui::Button::new("Rotate Agent Inbound Token"))
-                    .clicked()
-                {
-                    self.rotate_selected_agent_token();
-                }
-
-                if let Some(session) = &state.auth_session {
-                    ui.separator();
-                    ui.small(format!("Operator: {}", session.username));
-                    ui.small(format!("Role: {}", session.role));
-                    ui.small(format!("Session expires: {}", session.expires_at));
-                }
-
-                if let Some(message) = &state.flash {
-                    ui.colored_label(Color32::from_rgb(214, 97, 109), message);
-                }
-            });
-        });
-
-        ui.add_space(14.0);
-        ui.group(|ui| {
-            ui.heading("Recent Jobs");
-            ui.separator();
-            if let Some(snapshot) = &state.dashboard {
-                for job in snapshot.recent_jobs.iter().take(8) {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(&job.action).strong());
-                        ui.label(format!("on {}", job.agent_name));
-                        ui.colored_label(
-                            match job.status.as_str() {
-                                "completed" => Color32::from_rgb(187, 49, 64),
-                                "failed" => Color32::from_rgb(127, 69, 73),
-                                "running" => Color32::from_rgb(210, 98, 110),
-                                _ => Color32::from_rgb(154, 154, 160),
-                            },
-                            &job.status,
-                        );
-                        ui.small(&job.submitted_at);
-                        ui.label(&job.summary);
-                    });
-                    let detail_preview = summarize_job_details(&job.details_json);
-                    if !detail_preview.is_empty() {
-                        ui.add_space(4.0);
-                        ui.monospace(detail_preview);
-                    }
-                    ui.add_space(8.0);
-                }
-            } else {
-                ui.label("No dashboard data yet.");
-            }
-        });
-
-        if let Some(job) = &state.active_job {
-            ui.add_space(14.0);
-            ui.group(|ui| {
-                ui.heading("Live Job");
-                ui.separator();
-                ui.label(format!("{} [{}]", job.summary, job.status));
-                ui.small(format!("Job ID: {}", job.job_id));
-                ui.small(format!("Action: {}", job.action));
-                let output = job_output_text(&job.details_json);
-                if !output.is_empty() {
-                    egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
-                        ui.monospace(output);
-                    });
-                }
-            });
-        }
-
-        if can_admin {
-            ui.add_space(14.0);
-            ui.group(|ui| {
-                ui.heading("Audit Trail");
-                ui.separator();
-                for event in state.audit_events.iter().take(10) {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new(&event.action).strong());
-                        ui.label(format!("{} {}", event.target_type, event.target_id));
-                        ui.small(&event.created_at);
-                        if let Some(username) = &event.actor_username {
-                            ui.label(format!("by {}", username));
-                        }
-                    });
-                }
-            });
-        }
-    }
 }
 
-impl eframe::App for ClientApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        Self::configure_theme(ctx);
-        ctx.request_repaint_after(Duration::from_millis(250));
-        self.sync_view_with_auth();
-
-        if self.current_view == AppView::Main
-            && self.last_refresh.elapsed() > Duration::from_secs(5)
-        {
-            self.request_refresh();
-        }
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(Color32::from_rgb(6, 6, 8)))
-            .show(ctx, |ui| {
-                let rect = ui.max_rect();
-                let painter = ui.painter();
-                painter.rect_filled(rect, 0.0, Color32::from_rgb(5, 5, 7));
-                painter.circle_filled(
-                    rect.left_top() + egui::vec2(160.0, 110.0),
-                    220.0,
-                    Color32::from_rgba_unmultiplied(130, 18, 31, 24),
-                );
-                painter.circle_filled(
-                    rect.right_top() - egui::vec2(130.0, -80.0),
-                    260.0,
-                    Color32::from_rgba_unmultiplied(70, 10, 20, 36),
-                );
-                painter.line_segment(
-                    [
-                        rect.left_top() + egui::vec2(0.0, 92.0),
-                        rect.right_top() + egui::vec2(0.0, 92.0),
-                    ],
-                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(160, 20, 32, 20)),
-                );
-
-                let state = self.ui_state.read().unwrap().clone();
-
-                match self.current_view {
-                    AppView::Start => self.render_start_view(ui, &state),
-                    AppView::Main => self.render_main_view(ui, &state),
-                }
-            });
-    }
+fn pretty_output(json: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return json.into() };
+    if let Some(s) = v.get("stdout").and_then(|x| x.as_str()) { return s.trim().into(); }
+    if let Some(s) = v.get("error").and_then(|x| x.as_str())  { return format!("error: {s}"); }
+    serde_json::to_string_pretty(&v).unwrap_or_default()
 }
+
+// ── Network helpers ───────────────────────────────────────────────────────────
+
+async fn connect(endpoint: &str) -> Result<OrchestratorClient<Channel>> {
+    let ch = Channel::from_shared(endpoint.to_owned())?.connect().await?;
+    Ok(OrchestratorClient::new(ch))
+}
+
+async fn login(server: &str, username: &str, password: &str) -> Result<LoginResponse> {
+    let resp = reqwest::Client::new()
+        .post(format!("{server}/api/login"))
+        .json(&LoginRequest { username: username.into(), password: password.into() })
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("server returned {}", resp.status());
+    }
+    Ok(resp.json::<LoginResponse>().await?)
+}
+
+fn auth_req<T>(body: T, token: &str) -> tonic::Request<T> {
+    let mut req = tonic::Request::new(body);
+    let v = MetadataValue::try_from(format!("Bearer {token}")).unwrap();
+    req.metadata_mut().insert("authorization", v);
+    req
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    tracing_subscriber::fmt().with_env_filter("warn").init();
     let args = Args::parse();
-    let runtime = Arc::new(
-        Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("wraith-client")
-            .build()
-            .context("failed to build tokio runtime")?,
-    );
+    let rt   = Arc::new(Builder::new_multi_thread().enable_all().build()?);
 
-    let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("Wraith Operator Console")
-            .with_maximized(true),
-        ..Default::default()
-    };
-
-    let runtime_for_ui = runtime.clone();
-    let args_for_ui = args.clone();
-    let runner = move |_cc: &eframe::CreationContext<'_>| {
-        Ok::<Box<dyn eframe::App>, Box<dyn std::error::Error + Send + Sync>>(Box::new(
-            ClientApp::new(runtime_for_ui.clone(), args_for_ui.clone()),
-        ))
-    };
-
-    eframe::run_native("Wraith Operator Console", native_options, Box::new(runner))
-        .map_err(|err| anyhow::anyhow!(err.to_string()))
-}
-
-async fn enroll(
-    args: &Args,
-    token: &str,
-    client_name: &str,
-    validity_days: u32,
-) -> Result<(EnrollmentResponse, Option<PendingEnrollmentState>)> {
-    let ca_pem = fs::read(&args.ca_cert)
-        .with_context(|| format!("failed reading {}", args.ca_cert.display()))?;
-    let http = HttpClient::builder()
-        .use_rustls_tls()
-        .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem)?)
-        .build()
-        .context("failed to construct enrollment client")?;
-
-    let key_pair = KeyPair::generate().context("failed generating client private key")?;
-    let mut params = CertificateParams::new(Vec::<String>::new())?;
-    let mut distinguished_name = DistinguishedName::new();
-    distinguished_name.push(DnType::CommonName, client_name.to_owned());
-    params.distinguished_name = distinguished_name;
-    params
-        .subject_alt_names
-        .push(SanType::DnsName(detect_hostname().try_into()?));
-    let csr = params
-        .serialize_request(&key_pair)
-        .context("failed generating CSR")?;
-
-    let request = EnrollmentRequest {
-        enrollment_token: token.to_owned(),
-        client_name: client_name.to_owned(),
-        csr_pem: csr.pem()?,
-        requested_validity_days: validity_days,
-        device: DeviceIdentity {
-            hostname: detect_hostname(),
-            username: detect_username(),
-            platform: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
-            hardware_fingerprint: format!(
-                "{}:{}:{}",
-                detect_hostname(),
-                detect_username(),
-                std::env::consts::ARCH
-            ),
+    eframe::run_native(
+        "Wraith C2",
+        eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_title("Wraith C2")
+                .with_maximized(true)
+                .with_min_inner_size([800.0, 500.0]),
+            ..Default::default()
         },
-    };
-
-    let response = http
-        .post(format!("{}/api/v1/enroll", args.enrollment_endpoint))
-        .json(&request)
-        .send()
-        .await
-        .context("failed calling enrollment endpoint")?
-        .error_for_status()
-        .context("enrollment rejected by server")?
-        .json::<EnrollmentResponse>()
-        .await
-        .context("failed decoding enrollment response")?;
-
-    let key_pem = key_pair.serialize_pem();
-    if response.status == "issued" {
-        finalize_issued_enrollment(args, &response, &key_pem)?;
-        Ok((response, None))
-    } else {
-        let pending = PendingEnrollmentState {
-            request_id: response.request_id.clone(),
-            private_key_pem: key_pem,
-        };
-        persist_pending_enrollment(&args.pending_enrollment, &pending)?;
-        Ok((response, Some(pending)))
-    }
-}
-
-async fn login(args: &Args, username: &str, password: &str) -> Result<LoginResponse> {
-    let ca_pem = fs::read(&args.ca_cert)
-        .with_context(|| format!("failed reading {}", args.ca_cert.display()))?;
-    let http = HttpClient::builder()
-        .use_rustls_tls()
-        .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem)?)
-        .build()
-        .context("failed to construct auth client")?;
-
-    let response = http
-        .post(format!("{}/api/v1/auth/login", args.enrollment_endpoint))
-        .json(&LoginRequest {
-            username: username.to_owned(),
-            password: password.to_owned(),
-        })
-        .send()
-        .await
-        .context("failed calling auth login endpoint")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .json::<ApiError>()
-            .await
-            .map(|payload| payload.error)
-            .unwrap_or_else(|_| format!("server rejected username/password login ({status})"));
-        anyhow::bail!(body);
-    }
-
-    response
-        .json::<LoginResponse>()
-        .await
-        .context("failed decoding login response")
-}
-
-async fn logout_remote(args: &Args, session_token: &str) -> Result<()> {
-    let ca_pem = fs::read(&args.ca_cert)
-        .with_context(|| format!("failed reading {}", args.ca_cert.display()))?;
-    let http = HttpClient::builder()
-        .use_rustls_tls()
-        .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem)?)
-        .build()
-        .context("failed to construct auth client")?;
-
-    http.post(format!("{}/api/v1/auth/logout", args.enrollment_endpoint))
-        .json(&LogoutRequest {
-            session_token: session_token.to_owned(),
-        })
-        .send()
-        .await
-        .context("failed calling logout endpoint")?
-        .error_for_status()
-        .context("logout rejected by server")?;
-
-    Ok(())
-}
-
-async fn issue_bootstrap_token(
-    args: &Args,
-    session_token: &str,
-) -> Result<AgentBootstrapTokenResponse> {
-    let http = build_https_client(args)?;
-    let response = http
-        .post(format!(
-            "{}/api/v1/agents/bootstrap-token",
-            args.enrollment_endpoint
-        ))
-        .bearer_auth(session_token)
-        .send()
-        .await
-        .context("failed calling bootstrap token endpoint")?;
-    decode_json_response(response).await
-}
-
-async fn disable_agent(args: &Args, session_token: &str, agent_id: &str) -> Result<()> {
-    let http = build_https_client(args)?;
-    let response = http
-        .post(format!(
-            "{}/api/v1/agents/{}/disable",
-            args.enrollment_endpoint, agent_id
-        ))
-        .bearer_auth(session_token)
-        .send()
-        .await
-        .context("failed calling disable agent endpoint")?;
-    decode_empty_response(response).await
-}
-
-async fn rotate_agent_token(
-    args: &Args,
-    session_token: &str,
-    agent_id: &str,
-) -> Result<AgentBootstrapTokenResponse> {
-    let http = build_https_client(args)?;
-    let response = http
-        .post(format!(
-            "{}/api/v1/agents/{}/rotate-token",
-            args.enrollment_endpoint, agent_id
-        ))
-        .bearer_auth(session_token)
-        .send()
-        .await
-        .context("failed calling rotate agent token endpoint")?;
-    decode_json_response(response).await
-}
-
-async fn fetch_audit(args: &Args, session_token: &str) -> Result<Vec<AuditEventRecord>> {
-    let http = build_https_client(args)?;
-    let response = http
-        .get(format!("{}/api/v1/audit", args.enrollment_endpoint))
-        .bearer_auth(session_token)
-        .send()
-        .await
-        .context("failed calling audit endpoint")?;
-    decode_json_response(response).await
-}
-
-async fn fetch_enrollment_status(args: &Args, request_id: &str) -> Result<EnrollmentResponse> {
-    let http = build_https_client(args)?;
-
-    let response = http
-        .get(format!(
-            "{}/api/v1/enroll/{}",
-            args.enrollment_endpoint, request_id
-        ))
-        .send()
-        .await
-        .context("failed calling enrollment status endpoint")?
-        .error_for_status()
-        .context("enrollment status rejected by server")?
-        .json::<EnrollmentResponse>()
-        .await
-        .context("failed decoding enrollment status")?;
-
-    if response.status == "issued" {
-        let pending = load_pending_enrollment(&args.pending_enrollment)?
-            .ok_or_else(|| anyhow::anyhow!("missing pending enrollment state"))?;
-        finalize_issued_enrollment(args, &response, &pending.private_key_pem)?;
-    }
-
-    Ok(response)
-}
-
-async fn fetch_dashboard(args: &Args, session_token: &str) -> Result<DashboardSnapshot> {
-    let mut client = connect(args).await?;
-    let mut request = tonic::Request::new(Empty {});
-    attach_auth(&mut request, session_token)?;
-    client
-        .get_dashboard(request)
-        .await
-        .context("dashboard request failed")
-        .map(|response| response.into_inner())
-}
-
-async fn submit_job(
-    args: &Args,
-    session_token: &str,
-    request: SubmitJobRequest,
-) -> Result<SubmitJobResponse> {
-    let mut client = connect(args).await?;
-    let mut request = tonic::Request::new(request);
-    attach_auth(&mut request, session_token)?;
-    client
-        .submit_job(request)
-        .await
-        .context("job submission failed")
-        .map(|response| response.into_inner())
-}
-
-async fn watch_job_stream(
-    args: &Args,
-    session_token: &str,
-    job_id: &str,
-    ui_state: &Arc<RwLock<UiState>>,
-) -> Result<()> {
-    let mut client = connect(args).await?;
-    let mut request = tonic::Request::new(JobWatchRequest {
-        job_id: job_id.to_owned(),
-    });
-    attach_auth(&mut request, session_token)?;
-    let mut stream = client
-        .watch_job(request)
-        .await
-        .context("job watch request failed")?
-        .into_inner();
-
-    while let Some(update) = stream.message().await.context("job watch stream failed")? {
-        let finished = matches!(update.status.as_str(), "completed" | "failed");
-        let flash = format!("{} [{}]", update.summary, update.status);
-        let mut state = ui_state.write().unwrap();
-        state.active_job = Some(update);
-        state.flash = Some(flash);
-        drop(state);
-        if finished {
-            break;
-        }
-    }
-
-    Ok(())
-}
-
-fn attach_auth<T>(request: &mut tonic::Request<T>, session_token: &str) -> Result<()> {
-    let bearer = format!("Bearer {session_token}");
-    let value = MetadataValue::try_from(bearer.as_str())
-        .context("failed encoding session token for request metadata")?;
-    request.metadata_mut().insert("authorization", value);
-    Ok(())
-}
-
-fn build_https_client(args: &Args) -> Result<HttpClient> {
-    let ca_pem = fs::read(&args.ca_cert)
-        .with_context(|| format!("failed reading {}", args.ca_cert.display()))?;
-    HttpClient::builder()
-        .use_rustls_tls()
-        .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem)?)
-        .build()
-        .context("failed to construct HTTPS client")
-}
-
-async fn decode_json_response<T: serde::de::DeserializeOwned>(
-    response: reqwest::Response,
-) -> Result<T> {
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .json::<ApiError>()
-            .await
-            .map(|payload| payload.error)
-            .unwrap_or_else(|_| format!("request failed with {status}"));
-        anyhow::bail!(body);
-    }
-    response.json::<T>().await.context("failed decoding JSON response")
-}
-
-async fn decode_empty_response(response: reqwest::Response) -> Result<()> {
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response
-            .json::<ApiError>()
-            .await
-            .map(|payload| payload.error)
-            .unwrap_or_else(|_| format!("request failed with {status}"));
-        anyhow::bail!(body);
-    }
-    Ok(())
-}
-
-fn parse_command_args(input: &str) -> Vec<String> {
-    input
-        .split_whitespace()
-        .map(|item| item.to_owned())
-        .collect()
-}
-
-fn snapshot_commands(state: &UiState, selected_agent: usize) -> Vec<String> {
-    state
-        .dashboard
-        .as_ref()
-        .and_then(|snapshot| snapshot.agents.get(selected_agent))
-        .map(|agent| agent.commands.clone())
-        .unwrap_or_default()
-}
-
-fn summarize_job_details(raw: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return String::new();
-    };
-    if let Some(stdout) = value.get("stdout").and_then(|value| value.as_str()) {
-        return stdout.trim().to_owned();
-    }
-    if let Some(tail) = value.get("tail").and_then(|value| value.as_str()) {
-        return tail.trim().to_owned();
-    }
-    if let Some(error) = value.get("error").and_then(|value| value.as_str()) {
-        return error.to_owned();
-    }
-    if let Some(path) = value.get("path").and_then(|value| value.as_str()) {
-        let size = value
-            .get("size_bytes")
-            .and_then(|value| value.as_u64())
-            .unwrap_or(0);
-        return format!("Collected file: {path} ({size} bytes)");
-    }
-    String::new()
-}
-
-fn job_output_text(raw: &str) -> String {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return raw.to_owned();
-    };
-
-    let mut parts = Vec::new();
-    if let Some(stdout) = value.get("stdout").and_then(|value| value.as_str()) {
-        if !stdout.trim().is_empty() {
-            parts.push(stdout.trim().to_owned());
-        }
-    }
-    if let Some(stderr) = value.get("stderr").and_then(|value| value.as_str()) {
-        if !stderr.trim().is_empty() {
-            parts.push(stderr.trim().to_owned());
-        }
-    }
-
-    if parts.is_empty() {
-        summarize_job_details(raw)
-    } else {
-        parts.join("\n\n")
-    }
-}
-
-async fn connect(args: &Args) -> Result<OrchestratorClient<Channel>> {
-    let ca = fs::read(&args.ca_cert)
-        .with_context(|| format!("failed reading {}", args.ca_cert.display()))?;
-    let cert = fs::read(&args.client_cert)
-        .with_context(|| format!("failed reading {}", args.client_cert.display()))?;
-    let key = fs::read(&args.client_key)
-        .with_context(|| format!("failed reading {}", args.client_key.display()))?;
-
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(ca))
-        .identity(Identity::from_pem(cert, key))
-        .domain_name(&args.domain_name);
-
-    let channel = Endpoint::from_shared(args.endpoint.clone())?
-        .tls_config(tls)?
-        .connect()
-        .await?;
-
-    Ok(OrchestratorClient::new(channel))
-}
-
-fn persist_secure_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = if path.extension().and_then(|ext| ext.to_str()) == Some("key") {
-            0o600
-        } else {
-            0o644
-        };
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    }
-    Ok(())
-}
-
-fn finalize_issued_enrollment(args: &Args, response: &EnrollmentResponse, private_key_pem: &str) -> Result<()> {
-    let cert_pem = response
-        .client_certificate_pem
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("issued enrollment missing certificate"))?;
-    persist_secure_file(&args.client_key, private_key_pem.as_bytes())?;
-    persist_secure_file(&args.client_cert, cert_pem.as_bytes())?;
-    if args.pending_enrollment.exists() {
-        fs::remove_file(&args.pending_enrollment).ok();
-    }
-    Ok(())
-}
-
-fn load_pending_enrollment(path: &Path) -> Result<Option<PendingEnrollmentState>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content =
-        fs::read_to_string(path).with_context(|| format!("failed reading {}", path.display()))?;
-    serde_json::from_str(&content)
-        .map(Some)
-        .context("invalid pending enrollment state")
-}
-
-fn persist_pending_enrollment(path: &Path, pending: &PendingEnrollmentState) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, serde_json::to_vec_pretty(pending)?)
-        .with_context(|| format!("failed writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-fn detect_hostname() -> String {
-    std::env::var("HOSTNAME")
-        .or_else(|_| std::env::var("COMPUTERNAME"))
-        .unwrap_or_else(|_| "unknown-host".to_owned())
-}
-
-fn detect_username() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown-user".to_owned())
+        Box::new(move |_cc| Ok(Box::new(App::new(rt, args)))),
+    )
+    .map_err(|e| anyhow::anyhow!(e.to_string()))
 }

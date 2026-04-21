@@ -1,0 +1,29 @@
+[profile]
+name = "default-https"
+sleep_ms = 5000
+jitter_pct = 20
+description = "Clean HTTPS profile with generic API-style URIs"
+
+[transport]
+protocol = "https"
+host = "redirector.example.com"
+port = 443
+accept_invalid_certs = false
+
+[http]
+checkin_uri = "/api/v1/update"
+result_uri  = "/api/v1/result"
+user_agent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+uri_append_random = false
+
+[http.headers]
+Accept          = "application/json, text/plain, */*"
+Accept-Language = "en-US,en;q=0.9"
+Cache-Control   = "no-cache"
+Connection      = "keep-alive"
+
+[server]
+redirector_token       = "CHANGE_ME_STRONG_SECRET"
+internal_checkin_uri   = "/implant/checkin"
+internal_result_uri    = "/implant/result"
+decoy_url              = ""

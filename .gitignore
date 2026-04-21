@@ -1,20 +1,31 @@
+# ── Build output ──────────────────────────────────────────────────────────────
 /target
 **/target
 
-# Local secrets and generated PKI material
+# ── Secrets and credentials ───────────────────────────────────────────────────
 .env
-.env.*
+.env.local
+.env.*.local
+
+# TLS / PKI material
 *.pem
 *.key
 *.crt
 *.csr
+*.csr
 *.srl
+*.p12
+*.pfx
+*.der
 
-# Keep example/docs under certs, ignore generated cert assets
-certs/*
-!certs/README.md
+# Other common secret files
+*.secret
+*_secret
+secrets/
+credentials/
+*.token
 
-# Local database and runtime state
+# ── Database files ────────────────────────────────────────────────────────────
 data/
 *.db
 *.db-shm
@@ -22,10 +33,11 @@ data/
 *.sqlite
 *.sqlite3
 
-# Editor and OS noise
+# ── Editor and OS noise ───────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 .idea/
 .vscode/
-.codex
-.codex/
+*.swp
+*.swo
+*~

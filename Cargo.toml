@@ -1,5 +1,5 @@
 [workspace]
-members = ["shared", "server", "client", "agent"]
+members = ["shared", "server", "client", "profiles", "redirector", "implant"]
 resolver = "2"
 
 [workspace.package]
@@ -25,7 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls", "uuid", "chrono"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "uuid", "chrono"] }
 sysinfo = "0.37"
 time = "0.3"
 tokio = { version = "1.48", features = ["fs", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
@@ -37,4 +37,5 @@ tonic-build = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18", features = ["serde", "v4"] }
+toml = "0.8"
 x509-parser = "0.18"

@@ -1,83 +1,53 @@
 syntax = "proto3";
-
 package orchestrator;
+
+service Orchestrator {
+  rpc ListSessions    (Empty)               returns (SessionList);
+  rpc TaskSession     (TaskRequest)         returns (TaskResponse);
+  rpc ListSessionTasks(SessionTasksRequest) returns (SessionTaskList);
+}
 
 message Empty {}
 
-enum JobType {
-  JOB_TYPE_UNSPECIFIED = 0;
-  JOB_TYPE_HEALTH_CHECK = 1;
-  JOB_TYPE_COLLECT_METRICS = 2;
-  JOB_TYPE_FETCH_LOGS = 3;
-  JOB_TYPE_RUN_COMMAND = 4;
+message SessionSnapshot {
+  string session_id  = 1;
+  string hostname    = 2;
+  string username    = 3;
+  string os          = 4;
+  string arch        = 5;
+  string internal_ip = 6;
+  string profile     = 7;
+  string last_seen   = 8;
+  bool   active      = 9;
 }
 
-message SubmitJobRequest {
-  string agent_id = 1;
-  JobType job_type = 2;
-  uint32 log_lines = 3;
-  string log_source = 4;
-  string command_id = 5;
-  repeated string command_args = 6;
+message SessionList {
+  repeated SessionSnapshot sessions = 1;
 }
 
-message SubmitJobResponse {
-  bool accepted = 1;
-  string job_id = 2;
-  string status = 3;
-  string summary = 4;
-  string details_json = 5;
+message TaskRequest {
+  string session_id    = 1;
+  string module        = 2;
+  repeated string args = 3;
 }
 
-message JobWatchRequest {
-  string job_id = 1;
+message TaskResponse {
+  string task_id = 1;
 }
 
-message JobUpdate {
-  string job_id = 1;
-  string agent_id = 2;
-  string status = 3;
-  string summary = 4;
-  string details_json = 5;
-  string submitted_at = 6;
-  string started_at = 7;
-  string completed_at = 8;
-  string action = 9;
+message SessionTasksRequest {
+  string session_id = 1;
 }
 
-message AgentSnapshot {
-  string id = 1;
-  string name = 2;
-  string environment = 3;
-  string location = 4;
-  string endpoint = 5;
-  bool online = 6;
-  string status = 7;
-  string last_seen = 8;
-  repeated string capabilities = 9;
-  bool enabled = 10;
-  repeated string commands = 11;
+message TaskResult {
+  string          task_id     = 1;
+  string          module      = 2;
+  repeated string args        = 3;
+  string          status      = 4;
+  string          output_json = 5;
+  string          queued_at   = 6;
 }
 
-message RecentJob {
-  string job_id = 1;
-  string agent_id = 2;
-  string agent_name = 3;
-  string action = 4;
-  string status = 5;
-  string submitted_at = 6;
-  string summary = 7;
-  string details_json = 8;
-}
-
-message DashboardSnapshot {
-  repeated AgentSnapshot agents = 1;
-  repeated RecentJob recent_jobs = 2;
-  string generated_at = 3;
-}
-
-service Orchestrator {
-  rpc GetDashboard(Empty) returns (DashboardSnapshot);
-  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
-  rpc WatchJob(JobWatchRequest) returns (stream JobUpdate);
+message SessionTaskList {
+  repeated TaskResult tasks = 1;
 }
