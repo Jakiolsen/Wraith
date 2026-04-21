@@ -564,30 +564,235 @@ Evasion without a reliable foundation creates bugs that are hard to distinguish 
 
 ---
 
+## Phase 8 — Active Directory Attacks
+
+Active Directory is the primary target in most enterprise engagements. These modules require a foothold on a domain-joined host with at least a low-privileged domain user.
+
+### 8.1 Enumeration
+- `ad_info` — dump domain name, DC hostnames, domain functional level, and forest trust relationships via LDAP
+- `ad_users` — enumerate all domain user accounts: SAMAccountName, UPN, last logon, password last set, account flags (disabled, never expires, etc.)
+- `ad_groups` — list all groups and their members; flag high-value groups (Domain Admins, Enterprise Admins, Schema Admins, Account Operators)
+- `ad_computers` — list domain-joined computers with OS version and last logon
+- `ad_spns` — find accounts with SPNs set (Kerberoasting targets); output ready for hashcat
+- `ad_asrep` — find accounts with `DONT_REQUIRE_PREAUTH` set (AS-REP roasting targets)
+- `ad_gpo` — list all Group Policy Objects and which OUs they apply to; flag GPOs with write access for the current user
+- `ad_acl` — enumerate ACLs on high-value objects (Domain object, AdminSDHolder, GPOs) and flag abusable rights (GenericAll, WriteDACL, GenericWrite, ForceChangePassword)
+- `ad_trusts` — enumerate inter-domain and inter-forest trusts with direction and transitivity
+
+### 8.2 Credential attacks
+- `kerberoast` — request TGS tickets for all SPN accounts and return the encrypted tickets for offline cracking with hashcat (`-m 13100`)
+- `asrep_roast` — request AS-REP for accounts without pre-authentication and return hashes for offline cracking (`-m 18200`)
+- `pass_the_hash` — authenticate to remote services using an NTLM hash without knowing the cleartext password (via `NtLmSsp`)
+- `pass_the_ticket` — inject a Kerberos ticket (`.kirbi`) into the current session using `LsaCallAuthenticationPackage`
+- `overpass_the_hash` — use an NTLM hash to request a full Kerberos TGT, converting it to a usable ticket
+- `golden_ticket` — forge a TGT using the KRBTGT hash (requires Domain Admin / DCSync); provides persistent domain access
+- `silver_ticket` — forge a TGS for a specific service using the service account hash; bypasses the KDC entirely
+
+### 8.3 Privilege escalation
+- `dcsync` — impersonate a domain controller and request password hashes for any account using `MS-DRSR` (`DsGetNCChanges`); returns NTLM and AES Kerberos keys
+- `ntds_dump` — dump `NTDS.dit` and `SYSTEM` hive from a DC (volume shadow copy technique) for offline extraction
+- `lsass_dump` — dump LSASS process memory via `MiniDumpWriteDump` or direct syscall alternative; pipe output to `pypykatz` / `mimikatz`
+- `sam_dump` — dump SAM database and SYSTEM hive for local account hashes using VSS or registry save
+
+### 8.4 Lateral movement
+- `bloodhound_collect` — run a BloodHound-compatible JSON collection (sessions, ACLs, group memberships, trusts) and return the ZIP for import into BloodHound
+- `psremote` — execute a command on a remote host via PowerShell Remoting (WinRM); supports both NTLM and Kerberos auth
+- `rdp_hijack` — hijack a disconnected RDP session using `tscon` without knowing the user's password (requires SYSTEM)
+- `dcom_exec` — execute a command on a remote host via DCOM (`MMC20.Application`, `ShellBrowserWindow`) to avoid creating a new service
+
+---
+
+## Phase 9 — macOS Support
+
+macOS is common in corporate environments, particularly at developer and executive endpoints.
+
+### 9.1 Core platform support
+- Add `#[cfg(target_os = "macos")]` module tree mirroring the Linux structure
+- Implement platform-specific `sysinfo` fields: macOS version, hardware model, SIP status
+- Handle macOS code signing requirements for running unsigned binaries
+
+### 9.2 Credential harvesting
+- `keychain_dump` — extract credentials from the user's login keychain using the Security framework (`SecItemCopyMatching`); returns Wi-Fi passwords, stored web credentials, SSH passphrases
+- `safari_dump` — extract Safari saved passwords from `~/Library/Safari/` (requires Full Disk Access or keychain access)
+- `macos_browser_dump` — extract Chrome/Firefox/Brave credentials from their macOS profile paths
+
+### 9.3 Privilege escalation
+- `tcc_bypass` — enumerate apps with TCC permissions (Full Disk Access, Camera, Microphone) that can be abused to inherit permissions; document known bypass techniques per macOS version
+- `sudo_creds` — monitor for `sudo` invocations and capture the password via a TTY hook
+- `launch_agent_persist` — install or remove persistence via a `LaunchAgent` plist in `~/Library/LaunchAgents/`
+- `launch_daemon_persist` — install or remove persistence via a `LaunchDaemon` plist (requires root); survives reboots as a system service
+
+### 9.4 Evasion (macOS-specific)
+- **Gatekeeper bypass** — bundle the implant in a way that passes Gatekeeper checks on first execution
+- **Notarisation awareness** — detect if Gatekeeper or XProtect is active and adapt execution accordingly
+- **Dylib hijacking** — identify applications that load a missing dylib and plant a malicious one in the search path
+- **AppleScript automation** — use `osascript` to perform UI actions (keystrokes, clicks) that bypass permission prompts
+
+---
+
+## Phase 10 — Cloud and Container Post-Exploitation
+
+Engagements increasingly involve cloud-native infrastructure. These modules run on hosts inside cloud environments.
+
+### 10.1 Cloud metadata and credentials
+- `aws_meta` — query the AWS Instance Metadata Service (IMDS v1/v2) at `169.254.169.254` for IAM role credentials, instance identity, user-data, and security groups
+- `gcp_meta` — query the GCP metadata server for service account tokens, project ID, and startup scripts
+- `azure_meta` — query the Azure IMDS for managed identity tokens, subscription ID, and VM metadata
+- `aws_enum` — use harvested IAM credentials to enumerate S3 buckets, EC2 instances, Lambda functions, IAM users, and role policies via the AWS API
+- `az_enum` — use a stolen Azure token to enumerate subscriptions, resource groups, storage accounts, and Key Vault secrets
+
+### 10.2 Container escape
+- `docker_escape` — detect if running inside a Docker container (`.dockerenv`, cgroup checks) and attempt escape techniques: privileged container host mount, `runc` CVEs, `docker.sock` abuse
+- `k8s_escape` — detect Kubernetes environment variables and attempt to access the API server using the pod's service account token; enumerate pods, secrets, and config maps across namespaces
+- `cgroup_escape` — exploit a writable `release_agent` in a cgroup v1 hierarchy (requires `SYS_ADMIN` or privileged container) to execute on the host
+
+### 10.3 Kubernetes lateral movement
+- `k8s_secret_dump` — list and decode all secrets in accessible namespaces; flag secrets containing AWS keys, database URLs, or API tokens
+- `k8s_exec` — exec into another pod using the Kubernetes API (`/exec` endpoint) — lateral movement without network connections
+- `k8s_create_pod` — create a privileged pod that mounts the host filesystem for persistent access or node escape
+- `k8s_rbac_enum` — enumerate RBAC roles and bindings to find over-privileged service accounts or wildcard permissions
+
+### 10.4 Serverless and CI/CD
+- `env_scan` — scan environment variables for secrets: AWS keys (`AKIA`), GitHub tokens (`ghp_`), database URLs, private keys — common in Lambda, Cloud Run, GitHub Actions runners
+- `cicd_detect` — detect if running inside a CI/CD runner (GitHub Actions, GitLab CI, CircleCI, Jenkins) and extract the runner token, repository secrets, and pipeline permissions
+
+---
+
+## Phase 11 — Extension and Plugin System
+
+An extension system allows new modules to be loaded at runtime without recompiling the implant, similar to Cobalt Strike's Aggressor scripts and Sliver's Armory.
+
+### 11.1 BOF (Beacon Object File) loader
+- Implement a COFF/BOF loader in the implant: parse the COFF header, relocate sections, resolve API imports, and execute the entry point in-process
+- BOFs run in the implant's process without spawning a new process — stealthier than `shell`
+- Operator sends the BOF binary as a base64 task argument; output is captured and returned
+- Compatible with the Cobalt Strike BOF ecosystem (hundreds of public BOFs work without modification)
+
+### 11.2 Reflective DLL loading
+- Implement a reflective DLL loader: map a PE image from memory (fix relocations, resolve imports, call `DllMain`)
+- Operator sends the DLL as a base64 argument with an optional export function name to call
+- Enables running tools like `Rubeus`, `SharpHound`, `Seatbelt` entirely in-memory
+
+### 11.3 In-memory .NET (execute-assembly)
+- Host the CLR inside the implant process using `ICLRRuntimeHost`
+- Load a .NET assembly from a byte array without writing to disk
+- Capture stdout/stderr by redirecting the assembly's console output
+- Enables running `SharpHound`, `Certify`, `Rubeus`, `SharpDPAPI` directly
+
+### 11.4 Server-side extension API
+- Define a `wraith-ext` Rust trait crate that third-party modules implement
+- Extensions compile to shared libraries (`.so` / `.dll`) loaded by the server at startup from an `extensions/` directory
+- Each extension can register new gRPC endpoints, HTTP routes, and custom GUI views via a registration API
+- Provides hooks: `on_session_new`, `on_task_complete`, `on_checkin`
+
+### 11.5 Armory (extension marketplace)
+- `armory.toml` index file listing available extensions with name, version, description, and download URL
+- `wraith-server armory list` — show available extensions
+- `wraith-server armory install <name>` — download, verify SHA-256, and install extension
+- GUI: Armory view in the client showing installed and available extensions with install/remove buttons
+
+---
+
+## Phase 12 — Anti-Forensics and OPSEC
+
+Reduce the forensic footprint of the operation after tasks complete.
+
+### 12.1 Artefact cleanup
+- `timestomp` — modify file `Created`, `Modified`, and `Accessed` timestamps to match a reference file using `SetFileTime` (Windows) or `utimensat` (Linux)
+- `log_clear` — clear Windows Event Log channels (Security, System, Application, PowerShell) using `EvtClearLog`; on Linux, truncate `/var/log/auth.log`, `/var/log/syslog`, and `~/.bash_history`
+- `prefetch_delete` — delete Windows prefetch files for executed binaries from `C:\Windows\Prefetch\`
+- `mft_stomp` — overwrite the `$STANDARD_INFORMATION` timestamps in the NTFS MFT entry to match `$FILE_NAME` (defeats common timestomping detection)
+
+### 12.2 Anti-memory-forensics
+- `heap_wipe` — overwrite sensitive strings (URLs, passwords, keys) in the implant's heap before sleeping or executing sensitive operations
+- `stack_wipe` — zero stack frames of sensitive functions before returning
+- `pe_header_stomp` — zero out the DOS/PE header of the loaded implant image in memory to defeat `pe-sieve` and `Get-InjectedThread` type tools
+
+### 12.3 Network OPSEC
+- `conn_hide` — on Linux, use `LD_PRELOAD` or `ebpf` to hide the C2 TCP connection from `netstat` / `ss`
+- `dns_flush` — flush the DNS cache (`ipconfig /flushdns` on Windows, `systemd-resolve --flush-caches` on Linux) after DNS C2 sessions
+- **Canary detection** — before executing sensitive operations, check for sandbox/VM indicators: CPUID hypervisor bit, low uptime, small disk, user interaction metrics; sleep and retry if detected
+
+### 12.4 Process OPSEC
+- **Spawn-to** — all post-exploitation tasks that need a new process should spawn into a configurable "spawn-to" process (e.g. `svchost.exe`, `RuntimeBroker.exe`) rather than `cmd.exe` or `powershell.exe`
+- **Fork-and-run vs in-process toggle** — operator can choose per-task whether to run in a sacrificial process (safer, isolated) or in-process (stealthier, no new process)
+- **Module cleanup** — after reflective DLL or BOF execution, unmap the allocation and zero the memory
+
+---
+
+## Phase 13 — Reporting and Engagement Management
+
+Tie post-exploitation activity to deliverables and documentation.
+
+### 13.1 Engagement management
+- Add an `engagements` table in Postgres: `(id, name, client, start_date, end_date, scope_cidrs, notes)`
+- Sessions are tagged to an engagement; all loot, tasks, and audit log entries are scoped per engagement
+- Operators can switch between engagements without logging out
+- GUI: Engagement selector in the top bar; create/archive engagements from the Settings view
+
+### 13.2 MITRE ATT&CK mapping
+- Each module is annotated with its ATT&CK technique IDs (e.g. `shell` → T1059.004, `kerberoast` → T1558.003)
+- GUI: ATT&CK Navigator-style heatmap view showing which techniques have been exercised in the current engagement
+- Export the heatmap as a JSON layer file importable into the official ATT&CK Navigator
+
+### 13.3 Artefact tracking
+- Every file dropped, process created, registry key written, and network connection made by a module is logged to an `artefacts` table
+- GUI: Artefacts view showing a timeline of all side effects with session, module, and timestamp
+- Operator can mark artefacts as cleaned up; uncleaned artefacts are highlighted before engagement close
+
+### 13.4 Automated report generation
+- `wraith-server generate-report --engagement <id> --format [html|pdf|md]`
+- Report includes: engagement metadata, timeline of events, sessions discovered, credentials harvested, techniques used (with ATT&CK IDs), artefacts left behind, and recommendations
+- HTML/PDF output uses a template that can be customised per client
+- GUI: Generate Report button in the engagement view with format selector and download link
+
+### 13.5 Screenshot and evidence tagging
+- Operators can annotate screenshots and task outputs with a caption and evidence tag (e.g. `domain-admin-achieved`, `data-exfil`, `persistence-established`)
+- Tagged evidence is automatically included in the relevant report section
+- GUI: Right-click on any output block → "Add to report evidence" → enter caption
+
+### 13.6 Scope enforcement
+- Import a scope definition (CIDR ranges, hostnames, out-of-scope IPs) per engagement
+- Server warns (or blocks, configurable) if a module targets a host outside the defined scope
+- `port_scan`, `smb_exec`, `wmi_exec`, `ssh_exec` all check scope before executing
+- Scope violations are logged to the audit log regardless of whether they were blocked
+
+---
+
 ## Rough ordering summary
 
 ```
 Phase 1 (core stability)
     │
-    ├──► Phase 2 (server)  ──────────────────────────────────────────────┐
-    │        │                                                            │
-    │        └──► Phase 3 (GUI)                                          │
-    │                 │                                                   │
-    │    Phases 2+3 unlock:                                              │
-    │                 │                                                   ▼
-    └────────────────►├──► Phase 4 (implant modules)  ──► Phase 5 (transports)
+    ├──► Phase 2 (server)  ──────────────────────────────────────────────────────┐
+    │        │                                                                    │
+    │        └──► Phase 3 (GUI)                                                  │
+    │                 │                                                           │
+    │    Phases 2+3 unlock:                                                      │
+    │                 │                                                           ▼
+    └────────────────►├──► Phase 4 (implant modules)
+                      │         │
+                      │         ├──► Phase 8  (Active Directory)
+                      │         ├──► Phase 9  (macOS)
+                      │         └──► Phase 10 (cloud + containers)
                       │
-                      └──► Phase 6 (automation + infra)
-                                    │
-                                    ▼
-                               Phase 7 (evasion)  ← last, always
+                      ├──► Phase 5 (transports)
+                      │
+                      ├──► Phase 6 (automation + infra)
+                      │         │
+                      │         └──► Phase 11 (extension system)
+                      │
+                      ├──► Phase 12 (anti-forensics + OPSEC)
+                      │
+                      ├──► Phase 13 (reporting + engagement mgmt)
+                      │
+                      └──► Phase 7  (evasion)  ← last, always
 ```
 
 **Phase 1** must be complete before anything else — an unstable foundation makes all later work harder.
 
 **Phases 2 and 3** can be worked in parallel: server features (listeners, RBAC, real-time events) unlock
-corresponding GUI views (listeners manager, operators view, live dashboard). Build the server-side
-capability first, then wire it into the GUI.
+corresponding GUI views. Build server-side capability first, then wire it into the GUI.
 
 **Phase 3 implementation order** within the GUI:
 1. Layout chrome (top bar, sidebar, status bar, notifications) — everything hangs off this
@@ -596,12 +801,19 @@ capability first, then wire it into the GUI.
 4. Dashboard (needs real-time events from Phase 2.4)
 5. Listeners + Payload Builder (needs Phase 2.2 and Phase 6.1)
 6. Loot, Screenshots, Network Graph, Operators, Audit Log (add as backend support lands)
+7. ATT&CK heatmap + Artefacts + Report generation (needs Phase 13)
 
-**Phase 4** implant modules can be developed and tested independently; they appear automatically
-in the module selector dropdown once registered.
+**Phases 8, 9, 10** are implant module expansions — they can be built in parallel with each other
+once Phase 4 is underway. Each is self-contained: new files in the appropriate `modules/` directory.
 
-**Phase 6** automation (Ansible, payload builder) requires a stable, deployed server — do not
-start until Phase 2 is complete and the framework has been used in a real lab environment.
+**Phase 11** (extension system) requires a stable server and implant API — do not start until
+Phases 2 and 4 are solid, since the extension API surface will change frequently before that.
+
+**Phase 12** (anti-forensics) shares implementation patterns with Phase 7 (evasion) — work them
+together once evasion groundwork is laid.
+
+**Phase 13** (reporting) can start as soon as Phase 2 (server/database) is done — it only needs
+the existing data model and doesn't depend on any implant capabilities.
 
 **Phase 7** evasion is last. Do not start until the framework passes real operational use without
 evasion — bugs in an unevaded implant are much easier to diagnose than bugs in an evaded one.
