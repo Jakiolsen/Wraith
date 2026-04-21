@@ -21,34 +21,9 @@ Operator Client ──gRPC──► C2 Server ◄──HTTP── (optional Redi
 
 ---
 
-## Quick start (Docker)
+## Setup
 
-**Prerequisites:** Docker, Docker Compose
-
-```bash
-# 1. Copy and edit the environment file
-cp .env.example .env
-$EDITOR .env          # set POSTGRES_PASSWORD at minimum
-
-# 2. Start Postgres + server
-docker compose up -d
-
-# 3. Create the admin operator account
-docker compose exec server wraith-server provision-admin --username admin
-
-# 4. Start the operator client (runs locally, not in Docker)
-make client
-```
-
-The server exposes:
-- `0.0.0.0:8080` — HTTP (implant check-ins + `/api/login`)
-- `0.0.0.0:50051` — gRPC (operator client)
-
----
-
-## Manual setup (no Docker)
-
-**Prerequisites:** Rust (stable), PostgreSQL 14+, `protoc`, `make` (already available on Linux/macOS)
+**Prerequisites:** Rust (stable), PostgreSQL 14+, `protoc`
 
 ```bash
 # Create database and export connection string
@@ -58,13 +33,13 @@ export DATABASE_URL=postgres://user:pass@localhost/wraith
 # Build everything
 make build
 
-# Provision admin account
+# Provision admin account (first time only)
 make provision
 
-# Start server (separate terminal)
+# Start server (terminal 1)
 make server
 
-# Start client (separate terminal)
+# Start client (terminal 2)
 make client
 ```
 
@@ -155,14 +130,6 @@ make fmt        # format all code
 make release    # release build
 ```
 
-Docker helpers:
-```bash
-make docker-up          # start postgres + server
-make docker-down        # stop and remove containers
-make docker-provision   # create admin account in running container
-make docker-logs        # tail server logs
-```
-
 ---
 
 ## Architecture notes
@@ -176,7 +143,6 @@ make docker-logs        # tail server logs
 
 ## Security notes
 
-- Change `POSTGRES_PASSWORD` before any deployment — never use the example value.
 - The server and gRPC port should not be exposed to the internet in production; use firewall rules or a VPN.
 - Operator tokens are in-memory only and are lost on server restart (operators must log in again).
 - See `FUTURE_FEATURES.md` for planned hardening (mTLS, RBAC, audit log).
@@ -189,10 +155,6 @@ make docker-logs        # tail server logs
 Wraith/
 ├── Cargo.toml            workspace manifest
 ├── Makefile              task runner recipes
-├── docker-compose.yml
-├── docker/
-│   └── Dockerfile
-├── .env.example
 ├── proto/
 │   └── orchestrator.proto
 ├── shared/               wire types + protobuf generated code

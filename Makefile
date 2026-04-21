@@ -4,8 +4,7 @@
 .PHONY: help build release check fmt \
         server provision client \
         implant implant-linux implant-windows \
-        redirector \
-        docker-up docker-down docker-clean docker-logs docker-provision docker-build
+        redirector
 
 PROFILE  ?= profiles/examples/default-https.toml
 USERNAME ?= admin
@@ -64,22 +63,3 @@ redirector: ## Run the redirector (override profile with PROFILE=path/to/profile
 		--upstream http://127.0.0.1:8080 \
 		--listen   0.0.0.0:8443
 
-# ── Docker ────────────────────────────────────────────────────────────────────
-
-docker-up: ## Start postgres + server (detached)
-	docker compose up -d
-
-docker-down: ## Stop and remove containers (data volume preserved)
-	docker compose down
-
-docker-clean: ## Stop containers and wipe the database volume
-	docker compose down -v
-
-docker-logs: ## Tail server logs
-	docker compose logs -f server
-
-docker-provision: ## Create or reset admin account (override with USERNAME=name)
-	docker compose exec server wraith-server provision-admin --username $(USERNAME)
-
-docker-build: ## Rebuild the server image after code changes
-	docker compose build server
