@@ -1,819 +1,577 @@
 # Wraith C2 — Implementation Plan
 
-Phases are ordered by dependency and risk. Complete each phase before moving to the next.
-Evasion is deliberately last — a stable, capable framework is more valuable than an evasive broken one.
+**Core philosophy:** Assume every piece of infrastructure will eventually be identified.
+Design every layer so that when it is burned, the damage is contained, the operator is
+not exposed, and operations can resume from a clean slate within minutes.
+Security is not a phase — it is the foundation every other decision is built on.
 
 ---
 
-## Phase 1 — Stabilise the Core
+## OPSEC principles
 
-Get the existing code production-quality before adding anything new.
+Every decision in this plan follows these rules. When in doubt, the more conservative option wins.
 
-### 1.1 Configuration
-- Move hardcoded defaults (`127.0.0.1:8080`, beacon interval, etc.) into a `config.toml` loaded at startup
-- Server reads `DATABASE_URL` from env or config file; fail fast with a clear error if missing
-- Add `--config` flag to server and client to point at a non-default config path
-
-### 1.2 Error handling
-- Replace all `unwrap()` / `expect()` calls with proper error propagation
-- Return structured JSON error bodies from HTTP handlers (`{"error": "..."}`) instead of bare status codes
-- Log every error at the server with a request ID for traceability
-
-### 1.3 Operator token persistence
-- Currently tokens live only in memory — a server restart logs everyone out
-- Store session tokens in Postgres with an expiry timestamp
-- Add a `DELETE /api/logout` endpoint that removes the token
-- Enforce token expiry (e.g. 8 hours) on every authenticated request
-
-### 1.4 Tests
-- Unit tests for `dispatch()`, each common module, and password hashing
-- Integration test that spins up the server against a test Postgres database and exercises login → task → result round-trip
-- CI-friendly: `make test` runs everything with `cargo test`
-
-### 1.5 Logging
-- Structured JSON logging via `tracing` with fields: `request_id`, `session_id`, `operator`, `module`
-- Log to stdout (easy to redirect to a file or forward later)
-- Configurable log level via `RUST_LOG` env var
+1. **Assume burn** — every IP, domain, and certificate will eventually be identified. Design so that when it happens, the operator is not exposed and operations resume within minutes.
+2. **Compartmentalise** — one engagement cannot affect another. One burned redirector cannot reveal the server. One compromised operator cert cannot compromise others.
+3. **Minimal footprint** — never write to disk if memory works. Never spawn a process if in-process works. Never leave an artefact that isn't tracked for cleanup.
+4. **Fail closed** — when anything is uncertain (sandbox, honeypot, unexpected response), the implant does nothing and sleeps rather than proceeding.
+5. **No plaintext secrets anywhere** — not in env vars, not in logs, not in database columns, not in HTTP responses. Credentials are hashed or encrypted at rest; keys live only in process memory.
+6. **Operator is not the server** — the operator's machine never has a direct network path to the C2 server. At least one layer of indirection (VPN, jump box) sits between them at all times.
 
 ---
 
-## Phase 2 — Server Capabilities
+## Phase 1 — Hardened Foundation
 
-### 2.1 Multi-operator support
-- Add `role` enforcement to gRPC: `admin` can manage operators, `operator` can task sessions, `viewer` is read-only
-- `POST /api/operators` (admin only) — create operator accounts
-- `DELETE /api/operators/:username` (admin only) — revoke access
-- Per-session locking: an operator can claim a session so others cannot task it simultaneously
+Everything else is built on top of this. No capabilities until this is solid.
 
-### 2.2 Listener management
-- Replace the hardcoded HTTP listener with a dynamic listener registry stored in Postgres
-- Operators can create/delete/enable/disable listeners from the client without restarting the server
-- Each listener has: bind address, profile, redirector token, enabled flag
-- Server spawns/kills `axum` listeners at runtime as they are created or deleted
+### 1.1 mTLS everywhere
 
-### 2.3 Audit log
-- Append-only `audit_log` table: `(id, timestamp, operator, action, target, detail)`
-- Every operator action (login, logout, task, operator creation) writes a row
-- gRPC endpoint `ListAuditLog` with pagination, exposed in the client
+**Operator ↔ server (gRPC):**
+- Generate a per-deployment CA at first run using `rcgen`; CA private key never leaves the server
+- Server issues operator certificates signed by the CA; operators authenticate with their cert, not a password
+- Certificate revocation list (CRL) stored in Postgres; revoke a compromised operator cert without restarting
+- gRPC transport uses `rustls` with the deployment CA as the only trusted root — no system CAs
 
-### 2.4 Real-time events
-- Add a WebSocket endpoint `GET /ws/events` (operator-authenticated)
-- Server pushes events: new session, session dropped, task completed
-- Client subscribes on login and updates the UI without polling
+**Server ↔ redirector:**
+- Redirector gets its own certificate signed by the same CA
+- Server rejects any connection that does not present a valid redirector cert
+- Redirectors cannot be used to exfiltrate data even if compromised — they only relay, never store
 
-### 2.5 Webhook notifications
-- Config option: `webhook_url` + `webhook_events` (e.g. `["new_session", "task_complete"]`)
-- Server POSTs a JSON payload to the URL on matching events
-- Useful for alerting to Slack, Discord, or a custom dashboard
+**Why:** Plaintext gRPC means any network observer between the operator and server can read all tasking. mTLS means even if the server IP is burned and monitored, the traffic is opaque.
+
+### 1.2 Operator authentication overhaul
+
+- Remove username/password login entirely for production deployments
+- Operators authenticate exclusively via their mTLS client certificate
+- Certificates include the operator's username and role in the Subject
+- Tokens are eliminated — the cert IS the credential; no token to steal from memory
+- `provision-operator <username> <role>` generates a certificate bundle (`.p12`) shown once; server stores only the public cert
+
+### 1.3 Server hardening
+
+- Bind gRPC to `127.0.0.1` by default; only expose it through an mTLS-terminating reverse proxy
+- HTTP implant endpoint is the only surface exposed externally, and only via a redirector
+- No database port ever exposed outside the container network (already enforced by Docker Compose)
+- All Postgres credentials injected via Docker secrets (already implemented)
+- Add rate limiting on all HTTP endpoints: login attempts capped at 5/min per IP, implant check-ins at 60/min per IP
+- Enforce `Content-Type: application/json` on all API endpoints to prevent CSRF-style abuse
+- Add request size limits to prevent large-body DoS
+
+### 1.4 Credential storage hardening
+
+- Operator password hashes use Argon2id with tuned parameters (time=3, memory=64MB) — already using Argon2, tune the parameters
+- Loot credentials stored encrypted at rest using a per-engagement AES-256-GCM key derived from a master key that is never stored in the database
+- The master key lives only in the server process memory, derived from a passphrase entered at startup
+- On server shutdown the key is zeroed; credentials are inaccessible without restarting and re-entering the passphrase
+- Audit log is append-only and tamper-evident: each row contains an HMAC of the previous row's content
+
+### 1.5 Minimal attack surface
+
+- Remove all unused workspace crates and dependencies; run `cargo +nightly udeps` on every PR
+- No debug endpoints, no `/health` that reveals version, no stack traces in HTTP responses
+- Server version string is not exposed in any response header
+- Remove `tokio-stream` from server if unused; every unused dep is a potential CVE
+
+### 1.6 Error handling and fail-closed behaviour
+
+- All authentication failures return the same response body and take the same time (constant-time comparison, uniform error message) to prevent user enumeration
+- Any unexpected error in a security-critical path (auth, crypto) panics the request handler and returns 500 — never partially succeeds
+- Replace all `unwrap()` / `expect()` calls with proper propagation; a panic in production is a crash, not a silent corruption
+
+### 1.7 Tests
+
+- Unit tests for every crypto path: password hashing, token comparison, cert validation
+- Integration test: full mTLS handshake between a test client and the server using a generated cert bundle
+- Fuzz the HTTP handlers with `cargo-fuzz` targeting the JSON deserialisers
+- `make test` runs everything; CI blocks merges on any failure
 
 ---
 
-## Phase 3 — Operator Client (GUI)
+## Phase 2 — Infrastructure OPSEC
 
-The GUI is the operator's primary interface. The goal is a layout and feature set on par with
-Cobalt Strike's split-pane console, Mythic's rich task rendering and search, and Sliver's
-clean information density. Everything runs as a native egui desktop app.
+The server IP and domain are the most burned assets. Design for rapid rotation and maximum separation between the operator and the infrastructure.
+
+### 2.1 Redirector hardening
+
+- Redirectors only forward requests that match an exact allowlist of URI patterns from the active profile
+- Any request that does not match returns a `301` to a legitimate website (e.g. Microsoft, Cloudflare) — blue team scanning the redirector sees nothing suspicious
+- Redirectors log nothing to disk; all access logs are discarded
+- Redirector health is monitored by the server; if a redirector stops responding it is automatically marked offline and operators are notified
+- Add a `block_list` to the profile: requests from known security vendor IP ranges are silently dropped and redirected
+
+### 2.2 Domain strategy
+
+- Use aged domains (registered 6+ months before use) with matching WHOIS history
+- Categorise domains as business-relevant (finance, technology, logistics) before the engagement using domain categorisation services
+- Separate domains per engagement and per redirector — never reuse
+- Domain fronting: configure a CDN in front of the redirector so the SNI hostname is a legitimate CDN domain and the C2 domain is only in the HTTP `Host` header
+- Implement automatic domain rotation: if the server detects a redirector is being blocked (0 check-ins for N minutes from a previously active implant), it rotates implants to a fallback domain via a secondary channel
+
+### 2.3 Fallback channels
+
+- Every implant is compiled with a primary and up to three fallback C2 endpoints
+- If the primary fails for N consecutive attempts, the implant automatically tries the next endpoint
+- Endpoints use different transports (HTTPS, DNS, WebSocket) so blocking one transport does not kill the session
+- Fallback order and thresholds are configurable at build time via the payload builder
+
+### 2.4 Burn detection
+
+- The server tracks per-redirector check-in frequency; a sudden drop to zero from an active implant triggers a burn alert
+- Burn alert: push notification to all connected operators, flag the redirector as potentially burned, pause new task dispatch to affected sessions
+- Operators can acknowledge the burn and choose: rotate infrastructure, kill the session, or continue monitoring
+- All implant traffic is tagged with a per-session nonce; if the same session ID appears from two different IPs simultaneously, raise a split-session alert (possible man-in-the-middle or blue team replay)
+
+### 2.5 Infrastructure compartmentalisation
+
+- Each engagement gets its own redirector, its own domain, and its own operator certificate
+- The server is never directly reachable from the internet — always behind at least one redirector
+- If one engagement's infrastructure is burned, it cannot be used to trace back to other engagements or to the server
+- Operator VPN/Tor exit nodes are rotated between sessions; the server never sees the operator's real IP
+
+### 2.6 Fast infrastructure rotation (Ansible)
+
+- `ansible/` with roles: `redirector`, `wraith-server`
+- `make infra-up` spins up a new redirector on a VPS, generates its mTLS cert, registers it with the server, and updates the active profile — under 5 minutes
+- `make infra-burn <redirector-id>` revokes the redirector's cert, removes it from the profile, and destroys the VPS
+- All VPS provisioning uses throwaway payment methods and no personally identifying information
+
+### 2.7 TLS certificate OPSEC
+
+- Never use Let's Encrypt for C2 domains — LE certificates are logged in Certificate Transparency logs, which blue teams actively monitor
+- Use a commercial CA or a self-signed cert with a convincing subject (matching the domain's business persona)
+- Certificate validity period: 90 days maximum; rotate before expiry
+- HPKP (HTTP Public Key Pinning): implants pin the expected certificate fingerprint at build time; a cert mismatch aborts the connection rather than connecting to a potential MitM
 
 ---
 
-### 3.0 Layout and chrome
+## Phase 3 — Implant OPSEC
 
-**Overall structure** (never changes regardless of active view):
+The implant is the most exposed component. Every execution decision should minimise its visibility.
+
+### 3.1 Staging architecture
+
+Split the implant into two stages to minimise the initial footprint on disk:
+
+**Stage 0 (stager):** ~5 KB
+- Single purpose: connect to the C2, retrieve the stage 1 shellcode, load it into memory, jump to it
+- Contains no capability, no strings of interest beyond the C2 URL
+- Immediately overwrites itself in memory after loading stage 1
+- Short kill date: if stage 1 is not retrieved within 60 seconds, the stager exits cleanly
+
+**Stage 1 (full implant):**
+- Never written to disk; lives entirely in allocated memory
+- Loaded reflectively by stage 0
+- Contains all modules, beacon logic, and crypto material
+
+### 3.2 Anti-sandbox and environment validation
+
+Before doing anything, stage 0 validates the environment:
+
+- **Uptime check**: if system uptime < 10 minutes, sleep and retry — sandboxes reset frequently
+- **User interaction**: check that at least some mouse/keyboard events have occurred since boot (via `GetLastInputInfo` on Windows) — automated sandboxes rarely simulate user input
+- **Process list sanity**: count running processes; fewer than 30 on Windows suggests a sandbox
+- **Known sandbox processes**: check for `vmsrvc.exe`, `vboxservice.exe`, `wireshark.exe`, `procmon.exe`, `x96dbg.exe`, `fiddler.exe`, `charles.exe` and exit cleanly if found
+- **Domain check**: if the machine is not domain-joined and the engagement requires domain targets, skip execution
+- **Sleep acceleration test**: call `Sleep(1000)` and measure wall time; if it returns in under 100ms the sandbox is accelerating time
+- **CPUID hypervisor bit**: detect virtualisation at the hardware level
+- **Canary file/registry**: check for known blue team canary artefacts (honeytoken files, registry keys) and exit if found
+
+All checks are configurable at build time so they can be tuned per engagement.
+
+### 3.3 Callback hardening
+
+- Jitter: sleep interval varies by ±30% by default (configurable); never a perfectly regular interval
+- **Working hours only mode**: configurable time window (e.g. 08:00–18:00 Mon–Fri); implant sleeps outside this window to blend with legitimate business traffic
+- **Kill date**: hard-coded expiry timestamp; implant exits cleanly after this date with no external trigger needed
+- **Max check-in failures**: after N consecutive failed check-ins the implant enters a long sleep (24h) before retrying, rather than hammering a burned endpoint and generating alerts
+- **Response validation**: every server response must include a valid HMAC signed with the per-session key; unsigned or invalid responses are ignored (prevents blue team injecting fake tasks into a captured session)
+
+### 3.4 In-memory operation
+
+- Stage 1 is never written to disk under any circumstance
+- All module output is buffered in memory and sent in the next check-in; no temp files
+- File operations (`file_put`) write directly via syscall without going through the Win32 file API where possible
+- The implant's own PE header is zeroed in memory after loading (`pe_header_stomp`) so memory scanners cannot identify it by signature
+
+### 3.5 Sleep mask (memory encryption while idle)
+
+- While sleeping, the implant encrypts its own heap, stack, and text section using XOR with a per-session key
+- Uses the Ekko pattern: `NtContinue` + ROP chain to encrypt, sleep, decrypt — no RWX memory required
+- After decryption, verify integrity of the text section before resuming (detect tampering)
+- The encrypted blob is indistinguishable from random data to a memory scanner
+
+### 3.6 Execution OPSEC
+
+- **Spawn-to process**: all post-exploitation tasks that need a child process spawn into a configurable legitimate process (`svchost.exe -k netsvcs`, `RuntimeBroker.exe`) instead of `cmd.exe` or `powershell.exe`
+- **Fork-and-run vs in-process toggle**: operator selects per-task whether to run in a sacrificial process (crash-safe, isolated) or in-process (no new process creation event)
+- **Command-line spoofing**: after spawning a sacrificial process, overwrite its command line in the PEB to show an innocuous string instead of the actual arguments
+
+---
+
+## Phase 4 — Operator Security
+
+The operator's machine and connection are as much of an attack surface as the server.
+
+### 4.1 Operator network path
+
+- Operators connect to the server exclusively over a dedicated VPN (WireGuard) that terminates on a separate jump box, not directly on the C2 server
+- The jump box has no other services; its only role is WireGuard termination
+- Operator IP is never the same between sessions; rotate VPN exit node per engagement
+- The C2 server firewall allowlists only the jump box IP for gRPC; all other IPs are dropped silently
+
+### 4.2 Operator certificate lifecycle
+
+- Certificates are generated offline on the operator's machine, not on the server
+- The server receives only the public cert during provisioning — the private key never transits the network
+- Certificate validity: 7 days maximum for active engagements; revoke immediately on engagement close
+- Certificates are stored in the operator's OS keychain or a hardware token (YubiKey), not as files on disk
+- Lost or suspected-compromised cert: revoke via `wraith-server revoke-operator <username>`; takes effect on next connection attempt with zero downtime
+
+### 4.3 Session security
+
+- gRPC sessions have a maximum duration of 8 hours; client must re-authenticate after expiry
+- Idle sessions (no gRPC call for 30 minutes) are terminated server-side
+- Each gRPC message includes a monotonically increasing sequence number; replay attacks are detected and rejected
+
+### 4.4 Multi-operator isolation
+
+- Operators can only see sessions they have been explicitly assigned to, unless they hold the `admin` role
+- An operator cannot read another operator's task history or loot unless granted explicitly
+- Task dispatch is logged with the operator identity and cannot be repudiated
+- Two operators cannot simultaneously task the same session; a lock must be acquired first
+
+---
+
+## Phase 5 — Traffic OPSEC
+
+C2 traffic must be indistinguishable from legitimate business traffic at every inspection point.
+
+### 5.1 Malleable HTTP profiles
+
+Each listener has an associated profile defining the full shape of every HTTP request and response:
+
+- **URI patterns**: randomised from a pool of realistic paths (e.g. `/api/v2/sync`, `/update/check`, `/telemetry/batch`)
+- **Headers**: match a real browser/application exactly — `User-Agent`, `Accept`, `Accept-Encoding`, `Cache-Control`, `X-Requested-With`
+- **Body encoding**: data encoded as JSON, multipart form, or Base64 within a realistic-looking field name
+- **Response shape**: server responds with a realistic JSON/HTML body; C2 data is embedded in a specific field or HTTP header
+- **TLS fingerprint**: configure the TLS stack to produce a JA3 hash matching a common browser or application (Chromium, curl, Python requests)
+
+### 5.2 Traffic timing
+
+- Beacon interval jitter: ±30% by default, configurable up to ±80%
+- Working hours mode: callbacks only during configured time windows
+- Burst suppression: large task outputs are split across multiple check-ins with random delays between them to avoid sudden spikes in traffic volume
+- **Long-haul sleep**: between active tasking periods the implant can be put into a multi-day sleep via operator command; no callbacks during this period
+
+### 5.3 Protocol transport options
+
+Each transport is selectable at build time and fallback-ordered at runtime:
+
+| Transport | Blend-in target | Notes |
+|---|---|---|
+| HTTPS | Browser traffic | Default; profile-driven URI/header shaping |
+| DNS-over-HTTPS | DoH resolvers | Tunnels through port 443; hard to block without breaking browsing |
+| WebSocket | SaaS application traffic | Persistent connection; lower latency |
+| DNS TXT | DNS resolver queries | Ultra low bandwidth; works behind strict firewalls |
+| ICMP | Network monitoring traffic | Requires admin; last resort |
+| SMB named pipe | Internal file sharing | Peer-to-peer between implants; no direct internet required |
+
+### 5.4 Per-session traffic encryption
+
+Independent of TLS (which the redirector terminates):
+
+- On first check-in the implant generates an ephemeral X25519 keypair and sends the public key
+- Server generates its own ephemeral keypair and performs ECDH key exchange
+- Resulting shared secret is used to derive a per-session AES-256-GCM key via HKDF
+- All subsequent task and result data is encrypted with this key before being placed in the HTTP body
+- Even if TLS is stripped by a MitM (e.g. corporate SSL inspection proxy), the C2 data remains encrypted
+
+---
+
+## Phase 6 — Capabilities
+
+Core post-exploitation modules, built on top of the secure foundation.
+Every module follows the same OPSEC rules: in-memory where possible, spawn-to for child processes, artefact cleanup built in.
+
+### 6.1 Information gathering
+- `sysinfo` — hostname, OS, arch, uptime, domain membership, logged-in users (already exists)
+- `screenshot` — screen capture via BitBlt/X11; base64 PNG; no temp file
+- `clipboard` — read clipboard contents
+- `env` — dump environment variables
+- `browser_dump` — extract saved credentials from Chrome/Firefox profile directories
+
+### 6.2 Filesystem
+- `file_get` / `file_put` — already exists; add streaming for large files to avoid single large HTTP body
+- `file_browser` (ls) — directory listing with metadata
+- `file_search` — recursive search by name pattern or content string; useful for finding config files, SSH keys, credential stores
+
+### 6.3 Process operations
+- `proc_list` — already exists
+- `proc_kill` — kill by PID
+- `proc_inject` (Windows) — shellcode injection into a remote process
+- `execute_assembly` (Windows) — in-memory .NET via CLR hosting
+
+### 6.4 Persistence
+- Windows: registry Run key, scheduled task, WMI event subscription, COM hijacking
+- Linux: crontab, systemd user unit, `.bashrc` hook
+- All persistence modules accept `--action install|remove` and log the artefact to the server for cleanup tracking
+
+### 6.5 Credential harvesting
+- `lsass_dump` — LSASS memory via direct syscall (avoids `MiniDumpWriteDump` hook); stream output to server without writing to disk
+- `sam_dump` — SAM + SYSTEM hive via VSS
+- `keychain_dump` (macOS) — login keychain via Security framework
+- `dcsync` — MS-DRSR `DsGetNCChanges` to pull any account's hashes from a DC
+
+### 6.6 Active Directory
+- `ad_enum` — full LDAP enumeration: users, groups, computers, SPNs, AS-REP targets, GPOs, ACLs, trusts
+- `kerberoast` / `asrep_roast` — return encrypted tickets for offline cracking
+- `bloodhound_collect` — BloodHound-compatible JSON collection
+- `pass_the_hash` / `pass_the_ticket` / `golden_ticket` / `silver_ticket`
+- `lateral_move` — unified lateral movement: SMB exec, WMI exec, PSRemote, DCOM exec
+
+### 6.7 Privilege escalation
+- Linux: sudo enum, SUID scan, capabilities scan, writable PATH/cron
+- Windows: token list/steal, UAC bypass (fodhelper, eventvwr), named pipe impersonation
+- macOS: TCC bypass enumeration, LaunchDaemon privilege paths
+
+### 6.8 Tunnelling
+- `socks5` — SOCKS5 proxy server inside the implant via tokio channels
+- `port_fwd` — forward a specific remote port locally
+- `smb_relay` — peer-to-peer relay between implants over SMB named pipes
+
+### 6.9 Cloud and containers
+- `cloud_meta` — query AWS/GCP/Azure IMDS for credentials and metadata
+- `docker_escape` / `k8s_escape` — container escape via privileged container or `docker.sock`
+- `k8s_enum` — enumerate Kubernetes secrets, pods, RBAC
+
+---
+
+## Phase 7 — Anti-Forensics
+
+Clean up after every operation. Every artefact left behind is evidence.
+
+### 7.1 Artefact tracking
+
+The server maintains an `artefacts` table logging every side effect of every module: files written, registry keys created, processes spawned, scheduled tasks installed, WMI subscriptions registered.
+
+At the end of an operation, the operator runs a cleanup checklist generated from this table.
+Uncleaned artefacts are highlighted in the engagement report.
+
+### 7.2 Cleanup modules
+
+- `timestomp` — overwrite file timestamps (`Created`, `Modified`, `Accessed`) to match a reference file using `SetFileTime` / `utimensat`; also stomp the MFT `$STANDARD_INFORMATION` record to defeat MFT-based detection
+- `log_clear` — clear Windows Event Log channels (Security, System, Application, PowerShell/Operational) via `EvtClearLog`; on Linux truncate auth.log, syslog, bash_history
+- `prefetch_delete` — delete Windows Prefetch entries for executed binaries
+- `shred` — securely overwrite a file before deletion (overwrite with random bytes N times, then delete)
+
+### 7.3 Process cleanup
+
+- After every BOF, reflective DLL, or assembly execution: unmap the allocation and zero the memory
+- After every `proc_inject`: if the sacrificial process is no longer needed, kill it
+- Before any long sleep: wipe heap regions containing sensitive strings (URLs, keys, operator names)
+
+### 7.4 Network cleanup
+
+- `dns_flush` — flush the DNS resolver cache after DNS C2 sessions
+- `conn_hide` (Linux) — use `LD_PRELOAD` to hide the C2 connection from `ss` / `netstat`
+- After engagement: remove all port forwards and SOCKS5 listener bindings
+
+---
+
+## Phase 8 — Evasion
+
+Only after Phases 1–7 are solid. Evasion without a reliable, clean foundation creates
+bugs that are indistinguishable from detections — you cannot tell if you are being caught
+or if your own code is broken.
+
+### 8.1 API unhooking
+
+- On startup, remap `ntdll.dll` from `\KnownDlls\ntdll.dll` (a clean, unhooked copy maintained by the kernel) over the current process's `ntdll` text section
+- This removes every userland hook an AV/EDR has installed
+- Fallback: map a fresh copy from disk if `\KnownDlls` is not available
+
+### 8.2 Direct syscalls
+
+- HellsGate / Syswhisper3 pattern: walk the `ntdll` export table at runtime to resolve syscall numbers (SSNs)
+- Emit inline `syscall` stubs for all sensitive calls: `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtCreateThreadEx`, `NtReadVirtualMemory`, `NtQuerySystemInformation`
+- No dependence on userland `ntdll.dll` for any security-sensitive operation
+
+### 8.3 Stack spoofing
+
+- Before any suspicious API call, walk the stack and replace return addresses with addresses inside legitimate modules (`ntdll.dll`, `kernelbase.dll`)
+- Restore original return addresses after the call returns
+- Defeats EDR stack-walk detectors that flag calls originating from unbacked (non-module) memory
+
+### 8.4 AMSI and ETW bypass
+
+- Patch `AmsiScanBuffer` to return `AMSI_RESULT_CLEAN` — applied in-memory before any scripting engine is loaded
+- Zero the first bytes of `EtwEventWrite` to suppress ETW telemetry
+- Both patches applied only in-process; no disk writes; re-applied after any unhooking operation that would restore them
+
+### 8.5 Sleep mask (heap + text encryption)
+
+- Ekko/Foliage pattern: before sleeping, use an APC chain to:
+  1. Encrypt the implant's heap (RC4 or AES-128 with a random key stored only in registers)
+  2. Encrypt the text section
+  3. Mark memory as `PAGE_NOACCESS`
+  4. Wait for the sleep timer
+  5. Mark memory `PAGE_EXECUTE_READ`, decrypt text + heap, resume
+- The implant is completely opaque to any memory scanner while sleeping
+- After wake-up, verify text section integrity (detect EDR patching during sleep)
+
+### 8.6 Process injection improvements
+
+- Replace `CreateRemoteThread` with `NtQueueApcThread` (early-bird) — shellcode runs before the thread's main function
+- PPID spoofing: create sacrificial processes with a spoofed parent PID using `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`
+- Module stomping: write shellcode into an existing `PAGE_EXECUTE_READ` section of a legitimate module (e.g. a rarely-used `MUI` file mapped by a legitimate process) rather than allocating new RWX memory
+- `RtlCreateUserThread` as an alternative to `CreateRemoteThread` — less monitored
+
+### 8.7 PE obfuscation
+
+- **String encryption**: all hardcoded strings (C2 URLs, module names, API names) are XOR-encrypted at compile time via a build script; decrypted inline at first use then re-encrypted
+- **Import resolution by hash**: resolve all WinAPI imports at runtime by hashing the export name (djb2); no import table to inspect
+- **Section randomisation**: PE sections are given random names; `.text` becomes a random 8-character string
+- **Fake rich header**: overwrite the Rich header with plausible values matching a known legitimate compiler build
+- **Compile-time polymorphism**: vary the XOR key and string layout on every build so no two implants have the same byte pattern
+
+### 8.8 macOS-specific evasion
+
+- **Dylib injection via `DYLD_INSERT_LIBRARIES`**: inject into processes at launch without ptrace
+- **Gatekeeper bypass**: deliver via a signed container or an app bundle with a convincing structure; quarantine attribute removal after staging
+- **Code signing**: sign the stager with an Apple Developer certificate if available; dramatically reduces Gatekeeper/XProtect scrutiny
+
+### 8.9 Traffic-level evasion
+
+- **JA3 fingerprint control**: configure the TLS client hello to match a target browser; Cloudflare, ZScaler, and most NGFWs fingerprint TLS at the JA3 level
+- **HTTP/2**: use HTTP/2 for implant traffic; HTTP/2 is harder to inspect inline and produces a different network signature than HTTP/1.1
+- **Certificate pinning**: implant pins the expected redirector certificate fingerprint; rejects any unexpected cert (blocks SSL inspection MitM and active response proxies)
+
+---
+
+## Phase 9 — Operator Client (GUI)
+
+The GUI is built after the security foundation is solid. Every view reflects the security-first design.
+
+### 9.0 Layout and chrome
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  [≡] WRAITH          Sessions: 4 active    operator: jakob  │  ← top bar
+│  [≡] WRAITH     Sessions: 4 active    🔴 1 burn alert       │  ← top bar
 ├──────────┬──────────────────────────────────────────────────┤
 │          │                                                   │
 │ Sidebar  │              Main content area                    │
-│  nav     │         (changes with selected view)             │
 │          │                                                   │
 ├──────────┴──────────────────────────────────────────────────┤
-│  ● Connected  |  3 pending tasks  |  Last event: 00:42 ago  │  ← status bar
+│  ● mTLS OK  |  3 pending  |  Last event: 00:42 ago          │  ← status bar
 └─────────────────────────────────────────────────────────────┘
 ```
 
-**Top bar**
-- Wraith logo + version on the left
-- Live count of active sessions (green dot) and stale sessions (amber dot) in the centre
-- Logged-in operator name + role badge on the right
-- Bell icon with a red badge for unread notifications; clicking opens the notification drawer
-- Lock button to log out without closing the window
+- Top bar shows burn alerts prominently — one click opens the alert detail
+- Status bar shows mTLS connection state (green = valid cert, red = cert error or expired)
+- Lock button wipes in-memory session state and returns to the cert-auth screen
 
-**Sidebar navigation** (icon + label, collapsible to icon-only)
-- Dashboard
-- Sessions
-- Listeners
-- Payload Builder
-- Loot & Credentials
-- Screenshots
-- Network Graph
-- Operators *(admin only)*
-- Audit Log
-- Settings
+### 9.1 Dashboard
 
-**Status bar**
-- Server connection indicator (green/red dot + address)
-- Count of pending tasks across all sessions
-- Timestamp of the most recent event
-- Clickable: opens the event feed drawer
+- Stat cards: Active Sessions, Burn Alerts, Pending Tasks, Uncleaned Artefacts, Credentials Harvested
+- **Burn alert feed** — prominently displayed above other events; each alert shows which redirector, which sessions are affected, and recommended action
+- Recent events feed with live WebSocket updates
+- Infrastructure health panel: each redirector shown with check-in frequency sparkline
 
-**Notification system**
-- Toast popups in the bottom-right corner for: new session check-in, task completed, session dropped
-- Each toast shows session hostname, event type, and timestamp
-- Toasts are dismissible; they also auto-expire after 8 seconds
-- All notifications accumulate in the notification drawer until cleared
+### 9.2 Sessions view
 
----
+Full sessions table: Status | Session ID | Hostname | User | OS/Arch | IP | Transport | Last Seen | Tags
 
-### 3.1 Dashboard view
+- Status: green (active), amber (stale), red (dead), **purple (suspect — canary/honeypot flag)**
+- Transport indicator: shows which channel the session is using (HTTPS/DNS/SMB)
+- Right-click context menu: Open Console, File Browser, Process Manager, Rotate Transport, Kill, Add Note, Flag as Suspect
+- **Suspect flag**: when set, tasks are paused and the session is highlighted; operator must explicitly un-flag to resume tasking
 
-Inspired by Mythic's overview page — gives an at-a-glance picture of the engagement.
+### 9.3 Session Console
 
-- **Stat cards** across the top: Active Sessions, Total Sessions, Tasks Today, Credentials Harvested, Files Collected
-- **Recent events feed** — last 20 events (new session, task completed, operator login) with timestamps; auto-refreshes via WebSocket
-- **Session health chart** — simple bar or sparkline showing check-in frequency over the last hour per active session
-- **Top active sessions** — table of the 5 most recently active sessions with hostname, user, OS, last seen
-- **Quick-task bar** — select any active session from a dropdown and dispatch a module without navigating away
+Tabbed per-session console with rendered output (tables for `proc_list`, thumbnails for `screenshot`, key-value grids for `sysinfo`, monospace for `shell`). Input bar with module selector and args. Task history with Ctrl+F search.
 
----
+Adds OPSEC-specific features:
+- **OPSEC rating per module**: each module is labelled Low / Medium / High risk before execution (e.g. `lsass_dump` is High, `sysinfo` is Low); operator sees the rating before clicking Run
+- **Spawn-to selector**: per-task dropdown to choose the sacrificial process name
+- **Fork-and-run toggle**: per-task choice between in-process and sacrificial process execution
 
-### 3.2 Sessions view
+### 9.4 Infrastructure view
 
-The primary working view. Inspired by Cobalt Strike's beacon list and Mythic's callbacks table.
+Replaces the basic listeners view. Shows:
+- All redirectors with status, check-in rate, last seen, and mTLS cert expiry countdown
+- Burn status for each redirector (normal / suspected / confirmed)
+- One-click burn action: revoke cert, remove from profile, destroy VPS
+- Active domain list with categorisation status and age
+- Fallback channel status per session
 
-**Sessions table columns:**
-`Status | Session ID (short) | Hostname | User | OS / Arch | IP | Profile | Last Seen | Tags | Actions`
+### 9.5 Artefacts and cleanup view
 
-- **Status indicator**: filled green circle = active (checked in within 2 min), amber = stale (2–10 min), red = dead (>10 min)
-- **Sortable columns**: click any header to sort ascending/descending
-- **Search/filter bar**: free-text search across hostname, user, IP, tags; OS filter dropdown; status filter toggle
-- **Tags**: inline chips on each row; click to add/remove tags; tags are stored server-side and shared across operators
-- **Notes tooltip**: hover the session ID to see operator notes for that session
-- **Row actions (right-click context menu)**:
-  - Open Console
-  - Open File Browser
-  - Open Process Manager
-  - Inject shellcode…
-  - Kill session
-  - Add note…
-  - Add/remove tag…
-  - Copy session ID
-- **Multi-select**: hold Shift or Ctrl to select multiple rows; right-click menu shows bulk actions (kill, tag, task all)
-- **Double-click** a row to open the Session Console for that session
+- Timeline of all artefacts created across all sessions in the current engagement
+- Status per artefact: Pending cleanup / Cleaned / Ignored
+- One-click "generate cleanup task" sends the appropriate removal module to the session
+- Engagement close checklist: cannot mark engagement as closed with uncleaned artefacts unless explicitly overridden
+
+### 9.6 All other views
+
+- **File Browser**, **Process Manager**, **Payload Builder**, **Loot/Credentials**, **Screenshots**, **Network Graph**, **Operators**, **Audit Log**, **Settings** — same as previously planned, built after the security-critical views above
+- **MITRE ATT&CK heatmap** — shows technique coverage; also flags techniques that are considered high-noise (easy to detect) vs low-noise
+- **Engagement management** — scope enforcement, CIDR allowlists, out-of-scope warnings
 
 ---
 
-### 3.3 Session Console
+## Phase 10 — Automation and Infrastructure
 
-The main tasking interface. Each session opens its own console in a tab, inspired by Cobalt Strike's beacon console.
+### 10.1 Ansible deployment
 
-**Layout:**
+- Roles: `wraith-server`, `redirector`, `jumpbox` (WireGuard VPN termination)
+- `deploy.yml`: full VPS provisioning — OS hardening, firewall, Docker, secrets, start server
+- `rotate-redirector.yml`: spin up a new redirector, issue cert, update profile, destroy old one
+- `teardown.yml`: full engagement teardown — revoke all certs, wipe secrets, destroy VPS
+
+### 10.2 Payload builder API
+
+- `POST /api/payloads` on the server: cross-compile implant for target OS/arch with chosen transport, profile, sleep interval, kill date, and sandbox checks
+- Output stored encrypted in Postgres (same key as loot)
+- SHA-256 and build metadata shown at download time; operator verifies before deploying
+
+### 10.3 CI/CD pipeline
+
+- GitHub Actions: `cargo test` on every PR; `cargo audit` on schedule; release workflow builds signed implant artifacts on tag push
+- Implant artifacts for each release: Linux musl, Windows PE, Windows shellcode
+- Build environment is hermetic (no internet access during compile) to prevent supply chain interference
+
+### 10.4 Terraform infrastructure
+
+- Terraform modules for: VPS (DigitalOcean, Linode, Vultr), DNS zone delegation, CDN front
+- State stored locally (never in remote Terraform Cloud) with encryption at rest
+- `make infra-plan` previews changes; `make infra-apply` executes; `make infra-destroy` tears down cleanly
+
+---
+
+## Ordering summary
 
 ```
-┌─ Sessions ──────────────────────────────────────────────────────┐
-│  [WIN-DC01 \ SYSTEM]  [LINUXWEB01 \ www-data]  [+]             │  ← tab bar
-├─────────────────────────────────────────────────────────────────┤
-│  Hostname: WIN-DC01   User: SYSTEM   OS: Windows 10 x64        │
-│  IP: 10.10.10.5       Profile: default    Last seen: 00:12 ago │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  [00:01:04]  operator  →  shell whoami                         │
-│  [00:01:05]  ✓          nt authority\system                    │
-│                                                                  │
-│  [00:03:12]  operator  →  proc_list                            │
-│  [00:03:13]  ✓         ┌──────────┬──────┬───────────┐        │
-│                         │ PID      │ Name │ User      │        │
-│                         │ 4        │ Sys  │ SYSTEM    │        │
-│                         │ 688      │ lsas │ SYSTEM    │        │
-│                         │ ...      │ ...  │ ...       │        │
-│                         └──────────┴──────┴───────────┘        │
-│                                                                  │
-│  [00:05:44]  operator  →  screenshot                           │
-│  [00:05:45]  ✓         [image thumbnail — click to enlarge]    │
-│                                                                  │
-├─────────────────────────────────────────────────────────────────┤
-│  Module: [shell          ▾]  Args: [____________]  [Run ▶]     │
-│  Templates: [initial-recon ▾]  [Run template]                  │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-- **Tab bar**: one tab per open session; tabs show hostname + username; middle-click to close
-- **Session metadata strip**: key fields shown above the task history, always visible
-- **Task history**: scrollable log of all tasks for this session, oldest at top
-  - Each entry: timestamp, operator name (colour-coded per operator), module + args, then rendered output below
-  - Status icons: ⏳ pending, ✉ sent, ✓ completed (green), ✗ failed (red)
-  - **Rendered output by module type**:
-    - `proc_list` → sortable table (PID, name, user, memory)
-    - `sysinfo` → key-value grid
-    - `screenshot` → inline thumbnail, click to open full-size in an overlay
-    - `file_get` / `file_put` → file name + size, download button
-    - `shell` → monospace pre block with syntax highlighting for common CLIs
-    - Everything else → pretty-printed JSON with collapsible nested objects
-- **Input bar**: module selector dropdown + args text field + Run button
-- **Template runner**: select a saved template, runs all tasks sequentially with a progress indicator
-- **History search**: Ctrl+F opens a search bar that highlights matching text in the task history
-- **Copy button** on every output block
-
----
-
-### 3.4 Interactive Shell
-
-A dedicated PTY-backed terminal within a session console tab, inspired by Sliver's interactive sessions.
-
-- Separate tab labelled `[shell]` within the session console tab
-- Full terminal emulator widget (VT100/ANSI escape codes, colours, cursor movement)
-- Input is sent to the implant as raw stdin; output is streamed back and rendered character by character
-- Arrow key history, Ctrl+C, Ctrl+D handled correctly
-- Shell is kept alive between operator interactions — reconnecting to the same session reopens the existing shell if the implant is still running it
-- Resize events are forwarded to the PTY so ncurses tools render correctly
-
----
-
-### 3.5 File Browser
-
-Inspired by Cobalt Strike's file browser and Mythic's file management view.
-
-```
-┌─ File Browser: WIN-DC01 ─────────────────────────────────────────┐
-│  Path: [C:\Users\Administrator\          ] [Go] [↑ Up] [Refresh] │
-├──────────────────┬───────────┬─────────────┬──────────────────────┤
-│ Name             │ Size      │ Modified    │ Actions              │
-│ 📁 Desktop       │ —         │ 2024-01-05  │                      │
-│ 📁 Documents     │ —         │ 2024-01-03  │                      │
-│ 📄 passwords.txt │ 1.2 KB    │ 2024-01-06  │ [Download] [Delete]  │
-│ 📄 notes.docx    │ 48.3 KB   │ 2023-12-01  │ [Download] [Delete]  │
-├──────────────────┴───────────┴─────────────┴──────────────────────┤
-│ [Upload file…]                                  [New folder]       │
-└───────────────────────────────────────────────────────────────────┘
-```
-
-- Path bar: editable, with breadcrumb navigation above the table
-- Double-click a folder to navigate into it
-- Download: fetches the file via `file_get`, saves to the operator's local machine
-- Upload: opens a native file picker; sends via `file_put`; progress bar during transfer
-- Downloaded files are saved to `~/wraith-loot/<session-id>/` by default, configurable in settings
-- Right-click on any file: Download, Delete, Add to Loot
-
----
-
-### 3.6 Process Manager
-
-Inspired by Cobalt Strike's process list with inject actions.
-
-- Table: PID, PPID, Name, User, Architecture, Memory (MB)
-- Colour coding: SYSTEM/root processes in red, current implant process highlighted in amber
-- Search bar to filter by name or user
-- Right-click actions:
-  - Kill process
-  - Inject into process *(Windows only — opens shellcode input dialog)*
-  - Migrate implant to this process *(future)*
-- Refresh button re-dispatches `proc_list`; auto-refresh toggle (every 30s)
-
----
-
-### 3.7 Listeners view
-
-Manage C2 listeners without restarting the server (requires Phase 2.2).
-
-- Table: Name, Protocol, Bind address, Profile, Redirector token (masked), Status, Sessions
-- **Create listener** button: opens a form with fields for all listener parameters
-- Toggle switch on each row to enable/disable a listener
-- Delete button (confirms before removing)
-- Status badge: green = listening, red = error (hover to see error message)
-
----
-
-### 3.8 Payload Builder
-
-Wizard-style flow inspired by Mythic's payload creation and Cobalt Strike's payload generator.
-
-**Step 1 — Target**
-- OS: Linux / Windows / macOS
-- Architecture: x86_64 / x86 / aarch64
-- Format: ELF binary / PE executable / shellcode / DLL
-
-**Step 2 — C2 configuration**
-- Listener: dropdown of active listeners
-- Sleep interval + jitter percentage
-- Max retries before implant exits
-
-**Step 3 — Options**
-- Profile name (for traffic shaping)
-- Kill date: implant exits after this date
-- Working directory for execution
-
-**Step 4 — Review and build**
-- Summary of all selected options
-- Build button triggers `POST /api/payloads` on the server
-- Progress indicator while the server cross-compiles
-- Download button appears when the build completes
-- SHA-256 hash of the output file displayed for verification
-
-Built payloads are listed in a history table below the wizard with download and re-download links.
-
----
-
-### 3.9 Loot and Credentials view
-
-Inspired by Mythic's credentials tab and Cobalt Strike's credentials store.
-
-**Credentials table columns:**
-`Type | Value | Source host | Module | Captured at | Actions`
-
-- Types: `hash (NTLM)`, `hash (bcrypt)`, `cleartext`, `Kerberos ticket`, `SSH key`, `cookie`, `API token`
-- Search/filter by type, hostname, or keyword
-- Export to CSV button
-- Right-click → Copy value, Mark as used, Delete
-- `hash` entries have a Crack button that prepares a hashcat command for the operator to run locally
-
-**Files table** (separate tab within the loot view):
-- All files collected via `file_get` or downloaded through the file browser
-- Columns: filename, source path, source session, size, timestamp
-- Download again, open in system viewer, delete
-
----
-
-### 3.10 Screenshots gallery
-
-- Grid of thumbnail images, newest first
-- Each thumbnail labelled with hostname and timestamp
-- Click to open full-size in an overlay
-- Download button on each image
-- Filter by session or date range
-
----
-
-### 3.11 Network Graph view
-
-Visual topology map inspired by Cobalt Strike's pivot graph and Mythic's callback graph.
-
-- Each session is a node: icon reflects OS (penguin for Linux, window for Windows)
-- Node colour reflects status: green/amber/red matching the sessions table
-- Edges show the communication path: implant → redirector → server, or implant → peer (SMB pivot) → server
-- Click a node to open a detail panel (same metadata as the session console header)
-- Double-click a node to open the session console for that session
-- Drag nodes to rearrange; layout auto-organises on first load
-- Zoom and pan with mouse wheel and middle-drag
-
----
-
-### 3.12 Operators view *(admin only)*
-
-- Table: username, role, last login, active sessions claimed
-- Create operator: form with username + role selector; generated password shown once
-- Reset password button
-- Delete operator (cannot delete self)
-- Role badges: `admin` in red, `operator` in blue, `viewer` in grey
-
----
-
-### 3.13 Audit Log view
-
-- Paginated table: timestamp, operator, action, target, detail
-- Filter by operator, action type, or date range
-- Export to CSV
-- Auto-scrolls to the newest entry when the log view is open
-
----
-
-### 3.14 Settings view
-
-- **Server**: server URL, gRPC URL, connection timeout
-- **Appearance**: accent colour picker, font size, sidebar collapsed by default toggle
-- **Notifications**: toggle per event type (new session, task complete, session dropped)
-- **Loot directory**: where downloaded files are saved
-- **Keyboard shortcuts**: reference table (not configurable yet, just displayed)
-- **About**: version, build date, license
-
----
-
-### 3.15 Keyboard shortcuts
-
-| Shortcut | Action |
-|---|---|
-| `Ctrl+1` … `Ctrl+9` | Switch to sidebar view by position |
-| `Ctrl+T` | Open new session console tab |
-| `Ctrl+W` | Close current session console tab |
-| `Ctrl+Tab` | Next session console tab |
-| `Ctrl+Shift+Tab` | Previous session console tab |
-| `Ctrl+F` | Search within current view |
-| `Ctrl+R` | Refresh current view |
-| `Ctrl+L` | Lock (log out) |
-| `Escape` | Close overlay / dismiss notification |
-
----
-
-## Phase 4 — Implant Modules
-
-Build modules in this order: information gathering → file operations → lateral movement → privilege escalation.
-
-### 4.1 Information gathering
-- `screenshot` — capture the screen (BitBlt on Windows, X11/Wayland on Linux), return as base64 PNG
-- `clipboard` — read current clipboard contents
-- `browser_dump` — extract Chrome/Firefox saved passwords and cookies from profile directories
-- `env` — dump all environment variables
-
-### 4.2 Process and execution
-- `proc_kill` — kill a process by PID
-- `proc_inject` (Windows) — inject shellcode into a remote process via `VirtualAllocEx` + `WriteProcessMemory` + `CreateRemoteThread`
-- `execute_assembly` (Windows) — load and run a .NET assembly from memory using the CLR hosting API
-
-### 4.3 Persistence
-- **Windows**: registry Run key, scheduled task (XML via `schtasks`), startup folder LNK
-- **Linux**: crontab entry, systemd user unit (`~/.config/systemd/user/`), `.bashrc` append
-- Each persist module takes an `--action install|remove` argument
-
-### 4.4 Privilege escalation (Linux)
-- `sudo_enum` — run `sudo -l` and parse exploitable rules
-- `suid_scan` — find SUID binaries and cross-reference against a known-exploit list embedded in the binary
-- `cap_scan` — list files with dangerous capabilities (`cap_setuid`, `cap_net_raw`)
-
-### 4.5 Privilege escalation (Windows)
-- `token_list` — enumerate tokens of running processes using `OpenProcessToken`
-- `token_steal` — impersonate a higher-privileged token
-- `uac_bypass` — attempt known UAC bypass techniques (fodhelper, eventvwr)
-
-### 4.6 Lateral movement
-- `port_scan` — TCP connect scan of a CIDR range, returns open ports
-- `smb_exec` — execute a command on a remote host via SMB (`net use` + service creation)
-- `wmi_exec` — execute a command on a remote host via WMI (`Win32_Process.Create`)
-- `ssh_exec` — execute a command on a remote host using harvested SSH credentials
-
-### 4.7 Tunnelling
-- `socks5` — start a SOCKS5 proxy server on the implant; operator connects through it via a local port forward
-- `port_fwd` — forward a specific remote port to the operator's machine
-
----
-
-## Phase 5 — Transport Channels
-
-### 5.1 WebSocket transport
-- Replace HTTP polling with a persistent WebSocket connection
-- Operator-configurable: `transport = "ws"` or `transport = "http"` in the implant config
-- Reduces latency to near-zero; bidirectional command push
-
-### 5.2 DNS C2
-- Implant encodes data as DNS TXT queries to an operator-controlled domain
-- Server acts as an authoritative DNS resolver for that domain
-- Slow but highly evasive; suitable for heavily firewalled networks
-- Requires a VPS with control over a DNS zone
-
-### 5.3 SMB named-pipe transport
-- Implants on internal hosts relay traffic through a single internet-facing implant via SMB named pipes
-- Enables C2 on hosts with no direct internet access
-- Requires a `--relay` mode on the implant that acts as a peer-to-peer proxy
-
-### 5.4 ICMP transport
-- Encode data in ICMP echo request/reply payloads
-- Needs raw socket access (root / CAP_NET_RAW on Linux, admin on Windows)
-- Use as a fallback channel when all TCP/UDP ports are blocked
-
-### 5.5 Domain fronting
-- Route HTTPS traffic through a CDN (Cloudflare, Azure Front Door) to hide the true server IP
-- Implant sends `Host: <legit-domain>` header; CDN forwards to the actual server
-- Configured via the redirector profile: `fronted_host = "legitimate.cdn-domain.com"`
-
----
-
-## Phase 6 — Automation and Infrastructure
-
-### 6.1 Payload builder
-- Server-side API endpoint `POST /api/payloads` that triggers a cross-compile
-- Parameters: target OS, arch, server URL, sleep interval, profile name, format (ELF/PE/shellcode)
-- Output stored as a blob in Postgres, downloadable from the client
-- Requires the server host to have the cross-compile toolchains installed
-
-### 6.2 Ansible deployment
-- `ansible/` directory with roles: `postgres`, `wraith-server`, `redirector`
-- Single playbook `deploy.yml` that provisions a fresh VPS (Ubuntu/Debian) end-to-end:
-  - Installs Postgres, creates database and user
-  - Copies the server binary, creates a systemd unit, starts it
-  - Provisions the admin account and prints the password
-- Inventory file with variables: `server_host`, `redirector_hosts`, `domain`
-
-### 6.3 Redirector auto-provisioning
-- CLI subcommand `wraith-server provision-redirector --host <ip> --token <secret>`
-- Uses the Ansible redirector role under the hood via `ansible-playbook` subprocess call
-- Registers the new redirector in the database so operators can see it in the client
-
-### 6.4 TLS automation
-- Integrate `instant-acme` (Rust ACME client) into the redirector
-- On first start, redirector requests a Let's Encrypt certificate for its domain
-- Certificates are renewed automatically before expiry
-- Server ↔ redirector communication uses mTLS with a shared CA generated at deploy time
-
-### 6.5 CI/CD pipeline
-- GitHub Actions workflow `.github/workflows/release.yml`:
-  - On tag push: build Linux musl and Windows PE implants
-  - Upload artifacts to the GitHub release
-  - Run `cargo test` on every PR
-- Separate workflow for `cargo audit` to catch vulnerable dependencies
-
----
-
-## Phase 7 — Evasion
-
-Only implement after the framework is stable, tested, and operationally useful.
-Evasion without a reliable foundation creates bugs that are hard to distinguish from detection.
-
-### 7.1 In-memory execution
-- Remove implant from disk after first execution (overwrite then delete self on Linux; `MoveFileEx` `MOVEFILE_DELAY_UNTIL_REBOOT` on Windows)
-- Reflective loader: implant can load a second-stage PE from memory without calling `LoadLibrary`
-
-### 7.2 Sleep evasion
-- **Ekko / Foliage pattern**: encrypt implant's own memory (RW) while sleeping, decrypt on wake
-- Implemented as a custom sleep function that:
-  1. Queues an APC to encrypt the heap
-  2. Sleeps via `NtWaitForSingleObject` with jitter
-  3. Queues an APC to decrypt before resuming
-- Defeats memory scanners that run while the implant is idle
-
-### 7.3 API unhooking
-- On startup, overwrite the `.text` section of `ntdll.dll` in the current process with a clean copy read from `\KnownDlls\ntdll.dll` (bypasses userland AV hooks)
-- Alternatively: map a fresh copy of `ntdll.dll` from disk before any hooked function is called
-
-### 7.4 Direct syscalls
-- Generate syscall stubs at runtime (Syswhisper3 / HellsGate pattern): walk the export table to find SSNs, emit a small `syscall` stub per function
-- Replace all `NtAllocateVirtualMemory`, `NtWriteVirtualMemory`, `NtCreateThreadEx` calls with direct stubs
-- Eliminates dependence on userland `ntdll.dll` entirely for core operations
-
-### 7.5 Stack spoofing
-- Before making any suspicious API call, walk back up the stack and replace return addresses with addresses inside legitimate modules
-- Defeats EDR stack-walk detectors that flag calls originating from unbacked memory
-
-### 7.6 AMSI / ETW bypass
-- Patch `AmsiScanBuffer` in the current process to always return `AMSI_RESULT_CLEAN`
-- Zero out the first bytes of `EtwEventWrite` to suppress ETW telemetry
-- Both patches applied in-memory only; no disk writes
-
-### 7.7 Process injection improvements
-- Replace `CreateRemoteThread` with `NtQueueApcThread` (early-bird) or `RtlCreateUserThread`
-- PPID spoofing: create sacrificial processes with a spoofed parent (e.g. `explorer.exe`) using `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`
-- Stomping: write shellcode into an existing RX section of a legitimate module rather than allocating new RWX memory
-
-### 7.8 PE obfuscation
-- String encryption: XOR-encrypt all hardcoded strings (URLs, module names) at compile time; decrypt at runtime
-- Import obfuscation: resolve WinAPI functions by hash at runtime instead of using the import table
-- Section name randomisation and fake rich header to defeat static PE signatures
-
-### 7.9 Traffic obfuscation
-- Malleable HTTP profiles: randomise URI paths, headers, user-agent, and body padding per request
-- Encrypt C2 traffic with a per-session AES-256-GCM key negotiated at first check-in (independent of TLS)
-- Jitter: randomise sleep interval within a configurable range to avoid beacon timing signatures
-
----
-
-## Phase 8 — Active Directory Attacks
-
-Active Directory is the primary target in most enterprise engagements. These modules require a foothold on a domain-joined host with at least a low-privileged domain user.
-
-### 8.1 Enumeration
-- `ad_info` — dump domain name, DC hostnames, domain functional level, and forest trust relationships via LDAP
-- `ad_users` — enumerate all domain user accounts: SAMAccountName, UPN, last logon, password last set, account flags (disabled, never expires, etc.)
-- `ad_groups` — list all groups and their members; flag high-value groups (Domain Admins, Enterprise Admins, Schema Admins, Account Operators)
-- `ad_computers` — list domain-joined computers with OS version and last logon
-- `ad_spns` — find accounts with SPNs set (Kerberoasting targets); output ready for hashcat
-- `ad_asrep` — find accounts with `DONT_REQUIRE_PREAUTH` set (AS-REP roasting targets)
-- `ad_gpo` — list all Group Policy Objects and which OUs they apply to; flag GPOs with write access for the current user
-- `ad_acl` — enumerate ACLs on high-value objects (Domain object, AdminSDHolder, GPOs) and flag abusable rights (GenericAll, WriteDACL, GenericWrite, ForceChangePassword)
-- `ad_trusts` — enumerate inter-domain and inter-forest trusts with direction and transitivity
-
-### 8.2 Credential attacks
-- `kerberoast` — request TGS tickets for all SPN accounts and return the encrypted tickets for offline cracking with hashcat (`-m 13100`)
-- `asrep_roast` — request AS-REP for accounts without pre-authentication and return hashes for offline cracking (`-m 18200`)
-- `pass_the_hash` — authenticate to remote services using an NTLM hash without knowing the cleartext password (via `NtLmSsp`)
-- `pass_the_ticket` — inject a Kerberos ticket (`.kirbi`) into the current session using `LsaCallAuthenticationPackage`
-- `overpass_the_hash` — use an NTLM hash to request a full Kerberos TGT, converting it to a usable ticket
-- `golden_ticket` — forge a TGT using the KRBTGT hash (requires Domain Admin / DCSync); provides persistent domain access
-- `silver_ticket` — forge a TGS for a specific service using the service account hash; bypasses the KDC entirely
-
-### 8.3 Privilege escalation
-- `dcsync` — impersonate a domain controller and request password hashes for any account using `MS-DRSR` (`DsGetNCChanges`); returns NTLM and AES Kerberos keys
-- `ntds_dump` — dump `NTDS.dit` and `SYSTEM` hive from a DC (volume shadow copy technique) for offline extraction
-- `lsass_dump` — dump LSASS process memory via `MiniDumpWriteDump` or direct syscall alternative; pipe output to `pypykatz` / `mimikatz`
-- `sam_dump` — dump SAM database and SYSTEM hive for local account hashes using VSS or registry save
-
-### 8.4 Lateral movement
-- `bloodhound_collect` — run a BloodHound-compatible JSON collection (sessions, ACLs, group memberships, trusts) and return the ZIP for import into BloodHound
-- `psremote` — execute a command on a remote host via PowerShell Remoting (WinRM); supports both NTLM and Kerberos auth
-- `rdp_hijack` — hijack a disconnected RDP session using `tscon` without knowing the user's password (requires SYSTEM)
-- `dcom_exec` — execute a command on a remote host via DCOM (`MMC20.Application`, `ShellBrowserWindow`) to avoid creating a new service
-
----
-
-## Phase 9 — macOS Support
-
-macOS is common in corporate environments, particularly at developer and executive endpoints.
-
-### 9.1 Core platform support
-- Add `#[cfg(target_os = "macos")]` module tree mirroring the Linux structure
-- Implement platform-specific `sysinfo` fields: macOS version, hardware model, SIP status
-- Handle macOS code signing requirements for running unsigned binaries
-
-### 9.2 Credential harvesting
-- `keychain_dump` — extract credentials from the user's login keychain using the Security framework (`SecItemCopyMatching`); returns Wi-Fi passwords, stored web credentials, SSH passphrases
-- `safari_dump` — extract Safari saved passwords from `~/Library/Safari/` (requires Full Disk Access or keychain access)
-- `macos_browser_dump` — extract Chrome/Firefox/Brave credentials from their macOS profile paths
-
-### 9.3 Privilege escalation
-- `tcc_bypass` — enumerate apps with TCC permissions (Full Disk Access, Camera, Microphone) that can be abused to inherit permissions; document known bypass techniques per macOS version
-- `sudo_creds` — monitor for `sudo` invocations and capture the password via a TTY hook
-- `launch_agent_persist` — install or remove persistence via a `LaunchAgent` plist in `~/Library/LaunchAgents/`
-- `launch_daemon_persist` — install or remove persistence via a `LaunchDaemon` plist (requires root); survives reboots as a system service
-
-### 9.4 Evasion (macOS-specific)
-- **Gatekeeper bypass** — bundle the implant in a way that passes Gatekeeper checks on first execution
-- **Notarisation awareness** — detect if Gatekeeper or XProtect is active and adapt execution accordingly
-- **Dylib hijacking** — identify applications that load a missing dylib and plant a malicious one in the search path
-- **AppleScript automation** — use `osascript` to perform UI actions (keystrokes, clicks) that bypass permission prompts
-
----
-
-## Phase 10 — Cloud and Container Post-Exploitation
-
-Engagements increasingly involve cloud-native infrastructure. These modules run on hosts inside cloud environments.
-
-### 10.1 Cloud metadata and credentials
-- `aws_meta` — query the AWS Instance Metadata Service (IMDS v1/v2) at `169.254.169.254` for IAM role credentials, instance identity, user-data, and security groups
-- `gcp_meta` — query the GCP metadata server for service account tokens, project ID, and startup scripts
-- `azure_meta` — query the Azure IMDS for managed identity tokens, subscription ID, and VM metadata
-- `aws_enum` — use harvested IAM credentials to enumerate S3 buckets, EC2 instances, Lambda functions, IAM users, and role policies via the AWS API
-- `az_enum` — use a stolen Azure token to enumerate subscriptions, resource groups, storage accounts, and Key Vault secrets
-
-### 10.2 Container escape
-- `docker_escape` — detect if running inside a Docker container (`.dockerenv`, cgroup checks) and attempt escape techniques: privileged container host mount, `runc` CVEs, `docker.sock` abuse
-- `k8s_escape` — detect Kubernetes environment variables and attempt to access the API server using the pod's service account token; enumerate pods, secrets, and config maps across namespaces
-- `cgroup_escape` — exploit a writable `release_agent` in a cgroup v1 hierarchy (requires `SYS_ADMIN` or privileged container) to execute on the host
-
-### 10.3 Kubernetes lateral movement
-- `k8s_secret_dump` — list and decode all secrets in accessible namespaces; flag secrets containing AWS keys, database URLs, or API tokens
-- `k8s_exec` — exec into another pod using the Kubernetes API (`/exec` endpoint) — lateral movement without network connections
-- `k8s_create_pod` — create a privileged pod that mounts the host filesystem for persistent access or node escape
-- `k8s_rbac_enum` — enumerate RBAC roles and bindings to find over-privileged service accounts or wildcard permissions
-
-### 10.4 Serverless and CI/CD
-- `env_scan` — scan environment variables for secrets: AWS keys (`AKIA`), GitHub tokens (`ghp_`), database URLs, private keys — common in Lambda, Cloud Run, GitHub Actions runners
-- `cicd_detect` — detect if running inside a CI/CD runner (GitHub Actions, GitLab CI, CircleCI, Jenkins) and extract the runner token, repository secrets, and pipeline permissions
-
----
-
-## Phase 11 — Extension and Plugin System
-
-An extension system allows new modules to be loaded at runtime without recompiling the implant, similar to Cobalt Strike's Aggressor scripts and Sliver's Armory.
-
-### 11.1 BOF (Beacon Object File) loader
-- Implement a COFF/BOF loader in the implant: parse the COFF header, relocate sections, resolve API imports, and execute the entry point in-process
-- BOFs run in the implant's process without spawning a new process — stealthier than `shell`
-- Operator sends the BOF binary as a base64 task argument; output is captured and returned
-- Compatible with the Cobalt Strike BOF ecosystem (hundreds of public BOFs work without modification)
-
-### 11.2 Reflective DLL loading
-- Implement a reflective DLL loader: map a PE image from memory (fix relocations, resolve imports, call `DllMain`)
-- Operator sends the DLL as a base64 argument with an optional export function name to call
-- Enables running tools like `Rubeus`, `SharpHound`, `Seatbelt` entirely in-memory
-
-### 11.3 In-memory .NET (execute-assembly)
-- Host the CLR inside the implant process using `ICLRRuntimeHost`
-- Load a .NET assembly from a byte array without writing to disk
-- Capture stdout/stderr by redirecting the assembly's console output
-- Enables running `SharpHound`, `Certify`, `Rubeus`, `SharpDPAPI` directly
-
-### 11.4 Server-side extension API
-- Define a `wraith-ext` Rust trait crate that third-party modules implement
-- Extensions compile to shared libraries (`.so` / `.dll`) loaded by the server at startup from an `extensions/` directory
-- Each extension can register new gRPC endpoints, HTTP routes, and custom GUI views via a registration API
-- Provides hooks: `on_session_new`, `on_task_complete`, `on_checkin`
-
-### 11.5 Armory (extension marketplace)
-- `armory.toml` index file listing available extensions with name, version, description, and download URL
-- `wraith-server armory list` — show available extensions
-- `wraith-server armory install <name>` — download, verify SHA-256, and install extension
-- GUI: Armory view in the client showing installed and available extensions with install/remove buttons
-
----
-
-## Phase 12 — Anti-Forensics and OPSEC
-
-Reduce the forensic footprint of the operation after tasks complete.
-
-### 12.1 Artefact cleanup
-- `timestomp` — modify file `Created`, `Modified`, and `Accessed` timestamps to match a reference file using `SetFileTime` (Windows) or `utimensat` (Linux)
-- `log_clear` — clear Windows Event Log channels (Security, System, Application, PowerShell) using `EvtClearLog`; on Linux, truncate `/var/log/auth.log`, `/var/log/syslog`, and `~/.bash_history`
-- `prefetch_delete` — delete Windows prefetch files for executed binaries from `C:\Windows\Prefetch\`
-- `mft_stomp` — overwrite the `$STANDARD_INFORMATION` timestamps in the NTFS MFT entry to match `$FILE_NAME` (defeats common timestomping detection)
-
-### 12.2 Anti-memory-forensics
-- `heap_wipe` — overwrite sensitive strings (URLs, passwords, keys) in the implant's heap before sleeping or executing sensitive operations
-- `stack_wipe` — zero stack frames of sensitive functions before returning
-- `pe_header_stomp` — zero out the DOS/PE header of the loaded implant image in memory to defeat `pe-sieve` and `Get-InjectedThread` type tools
-
-### 12.3 Network OPSEC
-- `conn_hide` — on Linux, use `LD_PRELOAD` or `ebpf` to hide the C2 TCP connection from `netstat` / `ss`
-- `dns_flush` — flush the DNS cache (`ipconfig /flushdns` on Windows, `systemd-resolve --flush-caches` on Linux) after DNS C2 sessions
-- **Canary detection** — before executing sensitive operations, check for sandbox/VM indicators: CPUID hypervisor bit, low uptime, small disk, user interaction metrics; sleep and retry if detected
-
-### 12.4 Process OPSEC
-- **Spawn-to** — all post-exploitation tasks that need a new process should spawn into a configurable "spawn-to" process (e.g. `svchost.exe`, `RuntimeBroker.exe`) rather than `cmd.exe` or `powershell.exe`
-- **Fork-and-run vs in-process toggle** — operator can choose per-task whether to run in a sacrificial process (safer, isolated) or in-process (stealthier, no new process)
-- **Module cleanup** — after reflective DLL or BOF execution, unmap the allocation and zero the memory
-
----
-
-## Phase 13 — Reporting and Engagement Management
-
-Tie post-exploitation activity to deliverables and documentation.
-
-### 13.1 Engagement management
-- Add an `engagements` table in Postgres: `(id, name, client, start_date, end_date, scope_cidrs, notes)`
-- Sessions are tagged to an engagement; all loot, tasks, and audit log entries are scoped per engagement
-- Operators can switch between engagements without logging out
-- GUI: Engagement selector in the top bar; create/archive engagements from the Settings view
-
-### 13.2 MITRE ATT&CK mapping
-- Each module is annotated with its ATT&CK technique IDs (e.g. `shell` → T1059.004, `kerberoast` → T1558.003)
-- GUI: ATT&CK Navigator-style heatmap view showing which techniques have been exercised in the current engagement
-- Export the heatmap as a JSON layer file importable into the official ATT&CK Navigator
-
-### 13.3 Artefact tracking
-- Every file dropped, process created, registry key written, and network connection made by a module is logged to an `artefacts` table
-- GUI: Artefacts view showing a timeline of all side effects with session, module, and timestamp
-- Operator can mark artefacts as cleaned up; uncleaned artefacts are highlighted before engagement close
-
-### 13.4 Automated report generation
-- `wraith-server generate-report --engagement <id> --format [html|pdf|md]`
-- Report includes: engagement metadata, timeline of events, sessions discovered, credentials harvested, techniques used (with ATT&CK IDs), artefacts left behind, and recommendations
-- HTML/PDF output uses a template that can be customised per client
-- GUI: Generate Report button in the engagement view with format selector and download link
-
-### 13.5 Screenshot and evidence tagging
-- Operators can annotate screenshots and task outputs with a caption and evidence tag (e.g. `domain-admin-achieved`, `data-exfil`, `persistence-established`)
-- Tagged evidence is automatically included in the relevant report section
-- GUI: Right-click on any output block → "Add to report evidence" → enter caption
-
-### 13.6 Scope enforcement
-- Import a scope definition (CIDR ranges, hostnames, out-of-scope IPs) per engagement
-- Server warns (or blocks, configurable) if a module targets a host outside the defined scope
-- `port_scan`, `smb_exec`, `wmi_exec`, `ssh_exec` all check scope before executing
-- Scope violations are logged to the audit log regardless of whether they were blocked
-
----
-
-## Rough ordering summary
-
-```
-Phase 1 (core stability)
+Phase 1 (hardened foundation — mTLS, cert auth, server hardening)
     │
-    ├──► Phase 2 (server)  ──────────────────────────────────────────────────────┐
-    │        │                                                                    │
-    │        └──► Phase 3 (GUI)                                                  │
-    │                 │                                                           │
-    │    Phases 2+3 unlock:                                                      │
-    │                 │                                                           ▼
-    └────────────────►├──► Phase 4 (implant modules)
-                      │         │
-                      │         ├──► Phase 8  (Active Directory)
-                      │         ├──► Phase 9  (macOS)
-                      │         └──► Phase 10 (cloud + containers)
-                      │
-                      ├──► Phase 5 (transports)
-                      │
-                      ├──► Phase 6 (automation + infra)
-                      │         │
-                      │         └──► Phase 11 (extension system)
-                      │
-                      ├──► Phase 12 (anti-forensics + OPSEC)
-                      │
-                      ├──► Phase 13 (reporting + engagement mgmt)
-                      │
-                      └──► Phase 7  (evasion)  ← last, always
+    ├──► Phase 2 (infrastructure OPSEC — redirectors, domains, burn detection)
+    │         │
+    │         └──► Phase 5 (traffic OPSEC — profiles, per-session crypto, transports)
+    │
+    ├──► Phase 3 (implant OPSEC — staging, anti-sandbox, sleep mask, callback hardening)
+    │         │
+    │         └──► Phase 6 (capabilities — modules, built on OPSEC foundation)
+    │                   │
+    │                   └──► Phase 7 (anti-forensics — artefact tracking, cleanup)
+    │
+    ├──► Phase 4 (operator security — cert lifecycle, network path, session isolation)
+    │
+    ├──► Phase 9 (GUI — built after server security is solid)
+    │
+    ├──► Phase 10 (automation — Ansible, Terraform, CI/CD)
+    │
+    └──► Phase 8 (evasion — last; only after everything above works cleanly)
 ```
 
-**Phase 1** must be complete before anything else — an unstable foundation makes all later work harder.
-
-**Phases 2 and 3** can be worked in parallel: server features (listeners, RBAC, real-time events) unlock
-corresponding GUI views. Build server-side capability first, then wire it into the GUI.
-
-**Phase 3 implementation order** within the GUI:
-1. Layout chrome (top bar, sidebar, status bar, notifications) — everything hangs off this
-2. Sessions view + Session Console (core tasking loop)
-3. File Browser + Process Manager (most used after console)
-4. Dashboard (needs real-time events from Phase 2.4)
-5. Listeners + Payload Builder (needs Phase 2.2 and Phase 6.1)
-6. Loot, Screenshots, Network Graph, Operators, Audit Log (add as backend support lands)
-7. ATT&CK heatmap + Artefacts + Report generation (needs Phase 13)
-
-**Phases 8, 9, 10** are implant module expansions — they can be built in parallel with each other
-once Phase 4 is underway. Each is self-contained: new files in the appropriate `modules/` directory.
-
-**Phase 11** (extension system) requires a stable server and implant API — do not start until
-Phases 2 and 4 are solid, since the extension API surface will change frequently before that.
-
-**Phase 12** (anti-forensics) shares implementation patterns with Phase 7 (evasion) — work them
-together once evasion groundwork is laid.
-
-**Phase 13** (reporting) can start as soon as Phase 2 (server/database) is done — it only needs
-the existing data model and doesn't depend on any implant capabilities.
-
-**Phase 7** evasion is last. Do not start until the framework passes real operational use without
-evasion — bugs in an unevaded implant are much easier to diagnose than bugs in an evaded one.
+**Rule:** At every phase, ask "what happens when this component is burned or compromised?"
+If the answer is "the operator is exposed" or "other engagements are affected", the design is wrong.
+Fix the isolation before moving on.
