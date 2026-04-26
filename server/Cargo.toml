@@ -9,18 +9,23 @@ name = "wraith-server"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm.workspace            = true
 anyhow.workspace             = true
 argon2.workspace             = true
 axum.workspace               = true
 chrono.workspace             = true
 clap.workspace               = true
 rand_core.workspace          = true
+rcgen.workspace              = true
 serde.workspace              = true
 serde_json.workspace         = true
 sqlx.workspace               = true
+time.workspace               = true
 tokio.workspace              = true
 tonic.workspace              = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
 uuid.workspace               = true
+subtle.workspace             = true
+x509-parser.workspace        = true
 shared = { path = "../shared" }

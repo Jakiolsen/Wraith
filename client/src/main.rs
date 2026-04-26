@@ -1,18 +1,15 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use eframe::egui;
 use eframe::egui::Color32;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::runtime::{Builder, Runtime};
-use tonic::metadata::MetadataValue;
-use tonic::transport::Channel;
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity};
+use x509_parser::prelude::*;
 
-use shared::{
-    proto::{
-        orchestrator_client::OrchestratorClient, Empty, SessionTasksRequest, TaskRequest,
-    },
-    LoginRequest, LoginResponse,
+use shared::proto::{
+    orchestrator_client::OrchestratorClient, Empty, SessionTasksRequest, TaskRequest,
 };
 
 // ── colour palette ────────────────────────────────────────────────────────────
@@ -31,21 +28,36 @@ const MUTED:      Color32 = Color32::from_rgb(120, 122, 140);
 
 #[derive(Parser, Clone)]
 struct Args {
-    #[arg(long, default_value = "http://127.0.0.1:50051")]
+    #[arg(long, default_value = "https://127.0.0.1:50051")]
     grpc: String,
-    #[arg(long, default_value = "http://127.0.0.1:8080")]
-    server: String,
+    /// Operator certificate PEM file
+    #[arg(long, default_value = "certs/operator.cert.pem")]
+    cert: String,
+    /// Operator private key PEM file
+    #[arg(long, default_value = "certs/operator.key.pem")]
+    key: String,
+    /// CA certificate PEM file (to verify the server)
+    #[arg(long, default_value = "certs/ca.cert.pem")]
+    ca_cert: String,
+}
+
+// ── Auth state ────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Default)]
+struct AuthState {
+    username: String,
+    role:     String,
 }
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Default)]
 struct UiState {
-    auth:           Option<LoginResponse>,
-    flash:          Option<String>,
-    sessions:       Vec<shared::proto::SessionSnapshot>,
-    tasks:          Vec<shared::proto::TaskResult>,
-    pending_login:  bool,
+    auth:            Option<AuthState>,
+    flash:           Option<String>,
+    sessions:        Vec<shared::proto::SessionSnapshot>,
+    tasks:           Vec<shared::proto::TaskResult>,
+    pending_connect: bool,
 }
 
 struct App {
@@ -53,8 +65,10 @@ struct App {
     args:         Args,
     state:        Arc<RwLock<UiState>>,
     view:         View,
-    username:     String,
-    password:     String,
+    // connect form (fields are pre-filled from CLI args, user can edit)
+    cert_path:    String,
+    key_path:     String,
+    ca_cert_path: String,
     selected:     Option<String>,
     module:       String,
     task_args:    String,
@@ -62,17 +76,21 @@ struct App {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum View { Login, Sessions }
+enum View { Connect, Sessions }
 
 impl App {
     fn new(runtime: Arc<Runtime>, args: Args) -> Self {
+        let cert_path    = args.cert.clone();
+        let key_path     = args.key.clone();
+        let ca_cert_path = args.ca_cert.clone();
         Self {
             runtime,
             args,
             state:        Arc::new(RwLock::new(UiState::default())),
-            view:         View::Login,
-            username:     String::new(),
-            password:     String::new(),
+            view:         View::Connect,
+            cert_path,
+            key_path,
+            ca_cert_path,
             selected:     None,
             module:       "shell".into(),
             task_args:    String::new(),
@@ -84,64 +102,94 @@ impl App {
         self.state.write().unwrap().flash = Some(msg.into());
     }
 
-    fn token(&self) -> Option<String> {
-        self.state.read().unwrap().auth.as_ref().map(|a| a.token.clone())
-    }
+    fn do_connect(&self) {
+        let (grpc, cert, key, ca) = (
+            self.args.grpc.clone(),
+            self.cert_path.clone(),
+            self.key_path.clone(),
+            self.ca_cert_path.clone(),
+        );
+        let state = self.state.clone();
+        state.write().unwrap().pending_connect = true;
 
-    fn do_login(&self) {
-        let (username, password) = (self.username.clone(), self.password.clone());
-        let (server, state) = (self.args.server.clone(), self.state.clone());
-        self.state.write().unwrap().pending_login = true;
         self.runtime.spawn(async move {
-            match login(&server, &username, &password).await {
-                Ok(resp) => {
-                    let mut s = state.write().unwrap();
-                    s.flash = Some(format!("Logged in as {}", resp.username));
-                    s.auth  = Some(resp);
-                    s.pending_login = false;
+            match connect_mtls(&grpc, &cert, &key, &ca).await {
+                Ok((mut client, auth)) => {
+                    // Verify connection works
+                    match client.list_sessions(tonic::Request::new(Empty {})).await {
+                        Ok(_) => {
+                            let mut s = state.write().unwrap();
+                            s.flash           = Some(format!("Connected as {}", auth.username));
+                            s.auth            = Some(auth);
+                            s.pending_connect = false;
+                        }
+                        Err(e) => {
+                            let mut s = state.write().unwrap();
+                            s.flash           = Some(format!("Connection test failed: {e}"));
+                            s.pending_connect = false;
+                        }
+                    }
                 }
                 Err(e) => {
                     let mut s = state.write().unwrap();
-                    s.flash = Some(format!("Login failed: {e}"));
-                    s.pending_login = false;
+                    s.flash           = Some(format!("Connect failed: {e}"));
+                    s.pending_connect = false;
                 }
             }
         });
     }
 
     fn do_refresh(&mut self) {
-        let Some(token) = self.token() else { return };
-        let (grpc, state) = (self.args.grpc.clone(), self.state.clone());
+        if self.state.read().unwrap().auth.is_none() { return; }
+        let (grpc, cert, key, ca) = (
+            self.args.grpc.clone(),
+            self.cert_path.clone(),
+            self.key_path.clone(),
+            self.ca_cert_path.clone(),
+        );
+        let state    = self.state.clone();
         let selected = self.selected.clone();
+
         self.runtime.spawn(async move {
-            match connect(&grpc).await {
-                Ok(mut client) => {
-                    if let Ok(resp) = client.list_sessions(auth_req(Empty {}, &token)).await {
+            match connect_mtls(&grpc, &cert, &key, &ca).await {
+                Ok((mut client, _)) => {
+                    if let Ok(resp) = client.list_sessions(tonic::Request::new(Empty {})).await {
                         state.write().unwrap().sessions = resp.into_inner().sessions;
                     }
                     if let Some(sid) = selected {
-                        let req = auth_req(SessionTasksRequest { session_id: sid }, &token);
+                        let req = tonic::Request::new(SessionTasksRequest { session_id: sid });
                         if let Ok(resp) = client.list_session_tasks(req).await {
                             state.write().unwrap().tasks = resp.into_inner().tasks;
                         }
                     }
                 }
-                Err(e) => { state.write().unwrap().flash = Some(format!("Refresh failed: {e}")); }
+                Err(e) => {
+                    state.write().unwrap().flash = Some(format!("Refresh failed: {e}"));
+                }
             }
         });
         self.last_refresh = Instant::now();
     }
 
     fn do_dispatch(&self) {
-        let Some(sid)   = self.selected.clone() else { self.flash("No session selected."); return };
-        let Some(token) = self.token()           else { self.flash("Not logged in."); return };
-        let (grpc, state) = (self.args.grpc.clone(), self.state.clone());
+        let Some(sid) = self.selected.clone() else {
+            self.flash("No session selected.");
+            return;
+        };
+        let (grpc, cert, key, ca) = (
+            self.args.grpc.clone(),
+            self.cert_path.clone(),
+            self.key_path.clone(),
+            self.ca_cert_path.clone(),
+        );
+        let state = self.state.clone();
         let args: Vec<String> = self.task_args.split_whitespace().map(str::to_owned).collect();
         let req = TaskRequest { session_id: sid, module: self.module.clone(), args };
+
         self.runtime.spawn(async move {
-            match connect(&grpc).await {
-                Ok(mut client) => {
-                    match client.task_session(auth_req(req, &token)).await {
+            match connect_mtls(&grpc, &cert, &key, &ca).await {
+                Ok((mut client, _)) => {
+                    match client.task_session(tonic::Request::new(req)).await {
                         Ok(r)  => { state.write().unwrap().flash = Some(format!("Queued: {}", r.into_inner().task_id)); }
                         Err(e) => { state.write().unwrap().flash = Some(format!("Dispatch failed: {e}")); }
                     }
@@ -156,17 +204,17 @@ impl App {
 
 fn configure_theme(ctx: &egui::Context) {
     let mut v = egui::Visuals::dark();
-    v.override_text_color             = Some(TEXT);
-    v.panel_fill                      = PANEL;
-    v.extreme_bg_color                = BG;
-    v.faint_bg_color                  = CARD;
-    v.window_fill                     = CARD;
-    v.widgets.noninteractive.bg_fill  = CARD;
-    v.widgets.inactive.bg_fill        = Color32::from_rgb(20, 20, 28);
-    v.widgets.hovered.bg_fill         = Color32::from_rgb(30, 14, 20);
-    v.widgets.active.bg_fill          = ACCENT_DIM;
-    v.selection.bg_fill               = Color32::from_rgba_unmultiplied(196, 43, 62, 60);
-    v.window_stroke                   = egui::Stroke::new(1.0, BORDER);
+    v.override_text_color              = Some(TEXT);
+    v.panel_fill                       = PANEL;
+    v.extreme_bg_color                 = BG;
+    v.faint_bg_color                   = CARD;
+    v.window_fill                      = CARD;
+    v.widgets.noninteractive.bg_fill   = CARD;
+    v.widgets.inactive.bg_fill         = Color32::from_rgb(20, 20, 28);
+    v.widgets.hovered.bg_fill          = Color32::from_rgb(30, 14, 20);
+    v.widgets.active.bg_fill           = ACCENT_DIM;
+    v.selection.bg_fill                = Color32::from_rgba_unmultiplied(196, 43, 62, 60);
+    v.window_stroke                    = egui::Stroke::new(1.0, BORDER);
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER);
     ctx.set_visuals(v);
 
@@ -181,7 +229,7 @@ impl eframe::App for App {
         configure_theme(ctx);
         ctx.request_repaint_after(Duration::from_millis(500));
 
-        if self.view == View::Login {
+        if self.view == View::Connect {
             if self.state.read().unwrap().auth.is_some() {
                 self.view = View::Sessions;
                 self.do_refresh();
@@ -194,10 +242,10 @@ impl eframe::App for App {
 
         let state = self.state.read().unwrap().clone();
 
-        if self.view == View::Login {
+        if self.view == View::Connect {
             egui::CentralPanel::default()
                 .frame(egui::Frame::default().fill(BG))
-                .show(ctx, |ui| render_login(self, ui, &state));
+                .show(ctx, |ui| render_connect(self, ui, &state));
         } else {
             egui::SidePanel::left("nav")
                 .exact_width(175.0)
@@ -211,11 +259,11 @@ impl eframe::App for App {
     }
 }
 
-fn render_login(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
+fn render_connect(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
         ui.add_space(60.0);
         ui.vertical_centered(|ui| {
-            ui.set_max_width(420.0);
+            ui.set_max_width(480.0);
             ui.label(egui::RichText::new("◈").size(44.0).color(ACCENT));
             ui.add_space(6.0);
             ui.label(egui::RichText::new("W R A I T H").size(32.0).extra_letter_spacing(6.0).strong().color(TEXT));
@@ -230,31 +278,26 @@ fn render_login(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
 
-                    ui.label(egui::RichText::new("Username").size(11.0).color(MUTED));
-                    ui.add(egui::TextEdit::singleline(&mut app.username)
-                        .hint_text("admin")
-                        .desired_width(ui.available_width()));
-
+                    field_row(ui, "Cert", &mut app.cert_path,    "operator.cert.pem");
                     ui.add_space(6.0);
-                    ui.label(egui::RichText::new("Password").size(11.0).color(MUTED));
-                    let pw = ui.add(egui::TextEdit::singleline(&mut app.password)
-                        .password(true)
-                        .hint_text("password")
-                        .desired_width(ui.available_width()));
-                    let enter = pw.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    field_row(ui, "Key",  &mut app.key_path,     "operator.key.pem");
+                    ui.add_space(6.0);
+                    field_row(ui, "CA",   &mut app.ca_cert_path, "ca.cert.pem");
 
                     ui.add_space(12.0);
                     let w = ui.available_width();
                     let btn = egui::Button::new(
-                        egui::RichText::new(if state.pending_login { "Authenticating…" } else { "Login" }).size(13.0)
+                        egui::RichText::new(
+                            if state.pending_connect { "Connecting…" } else { "Connect" }
+                        ).size(13.0)
                     )
                     .fill(ACCENT_DIM)
                     .stroke(egui::Stroke::new(1.0, ACCENT))
                     .corner_radius(6.0)
                     .min_size(egui::vec2(w, 38.0));
 
-                    if (ui.add_enabled(!state.pending_login, btn).clicked() || enter) && !state.pending_login {
-                        app.do_login();
+                    if ui.add_enabled(!state.pending_connect, btn).clicked() {
+                        app.do_connect();
                     }
 
                     if let Some(msg) = &state.flash {
@@ -270,6 +313,14 @@ fn render_login(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
                 });
         });
     });
+}
+
+fn field_row(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) {
+    ui.label(egui::RichText::new(label).size(11.0).color(MUTED));
+    ui.add(egui::TextEdit::singleline(value)
+        .hint_text(hint)
+        .desired_width(ui.available_width())
+        .font(egui::TextStyle::Monospace));
 }
 
 fn render_sidebar(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
@@ -305,7 +356,7 @@ fn render_sidebar(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
             s.sessions.clear();
             s.tasks.clear();
             drop(s);
-            app.view = View::Login;
+            app.view = View::Connect;
         }
     });
 }
@@ -346,8 +397,8 @@ fn render_sessions(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
 
     ui.add(egui::Separator::default().horizontal().spacing(0.0));
 
-    let total_h    = ui.available_height();
-    let console_h  = if app.selected.is_some() { 240.0 } else { 0.0 };
+    let total_h   = ui.available_height();
+    let console_h = if app.selected.is_some() { 240.0 } else { 0.0 };
 
     egui::ScrollArea::vertical().id_salt("sess").max_height(total_h - console_h - 2.0)
         .auto_shrink([false, false]).show(ui, |ui| {
@@ -490,14 +541,14 @@ fn pretty_output(json: &str) -> String {
 }
 
 fn format_sysinfo(v: &serde_json::Value) -> String {
-    let hostname  = v["hostname"].as_str().unwrap_or("unknown");
-    let os        = v["os"].as_str().unwrap_or("unknown");
-    let kernel    = v["kernel"].as_str().unwrap_or("unknown");
-    let arch      = v["arch"].as_str().unwrap_or("unknown");
-    let cpus      = v["cpu_count"].as_u64().unwrap_or(0);
-    let total_mb  = v["total_memory_mb"].as_u64().unwrap_or(0);
-    let used_mb   = v["used_memory_mb"].as_u64().unwrap_or(0);
-    let uptime    = v["uptime_secs"].as_u64().unwrap_or(0);
+    let hostname = v["hostname"].as_str().unwrap_or("unknown");
+    let os       = v["os"].as_str().unwrap_or("unknown");
+    let kernel   = v["kernel"].as_str().unwrap_or("unknown");
+    let arch     = v["arch"].as_str().unwrap_or("unknown");
+    let cpus     = v["cpu_count"].as_u64().unwrap_or(0);
+    let total_mb = v["total_memory_mb"].as_u64().unwrap_or(0);
+    let used_mb  = v["used_memory_mb"].as_u64().unwrap_or(0);
+    let uptime   = v["uptime_secs"].as_u64().unwrap_or(0);
 
     let days    = uptime / 86400;
     let hours   = (uptime % 86400) / 3600;
@@ -508,9 +559,9 @@ fn format_sysinfo(v: &serde_json::Value) -> String {
         (d, h, m) => format!("{d}d {h}h {m}m"),
     };
 
-    let mem_pct = if total_mb > 0 { used_mb * 100 / total_mb } else { 0 };
+    let mem_pct    = if total_mb > 0 { used_mb * 100 / total_mb } else { 0 };
     let bar_filled = (mem_pct / 5) as usize;
-    let mem_bar = format!("[{}{}]", "█".repeat(bar_filled), "░".repeat(20 - bar_filled));
+    let mem_bar    = format!("[{}{}]", "█".repeat(bar_filled), "░".repeat(20 - bar_filled));
 
     format!(
         "  Hostname  {hostname}\n  OS        {os}\n  Kernel    {kernel}\n  Arch      {arch}\n  CPUs      {cpus}\n  Memory    {mem_bar} {used_mb}M / {total_mb}M ({mem_pct}%)\n  Uptime    {uptime_str}"
@@ -561,18 +612,12 @@ fn render_proc_node(
     let name = p["name"].as_str().unwrap_or("?");
     let user = p["user"].as_str().unwrap_or("");
     let mem  = p["mem_kb"].as_u64().unwrap_or(0);
-    let mem_str = if mem >= 1024 {
-        format!("{:.1}M", mem as f64 / 1024.0)
-    } else {
-        format!("{mem}K")
-    };
+    let mem_str = if mem >= 1024 { format!("{:.1}M", mem as f64 / 1024.0) } else { format!("{mem}K") };
 
-    let connector   = if is_last { "└── " } else { "├── " };
+    let connector    = if is_last { "└── " } else { "├── " };
     let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
 
-    out.push_str(&format!(
-        "{prefix}{connector}{pid:<6} {name:<22} {user:<14} {mem_str}\n"
-    ));
+    out.push_str(&format!("{prefix}{connector}{pid:<6} {name:<22} {user:<14} {mem_str}\n"));
 
     if let Some(kids) = children.get(&pid) {
         for (i, &kid) in kids.iter().enumerate() {
@@ -583,33 +628,67 @@ fn render_proc_node(
 
 // ── Network helpers ───────────────────────────────────────────────────────────
 
-async fn connect(endpoint: &str) -> Result<OrchestratorClient<Channel>> {
-    let ch = Channel::from_shared(endpoint.to_owned())?.connect().await?;
-    Ok(OrchestratorClient::new(ch))
-}
+async fn connect_mtls(
+    endpoint:    &str,
+    cert_path:   &str,
+    key_path:    &str,
+    ca_cert_path: &str,
+) -> Result<(OrchestratorClient<Channel>, AuthState)> {
+    let cert_pem    = tokio::fs::read(cert_path).await
+        .with_context(|| format!("reading cert: {cert_path}"))?;
+    let key_pem     = tokio::fs::read(key_path).await
+        .with_context(|| format!("reading key: {key_path}"))?;
+    let ca_cert_pem = tokio::fs::read(ca_cert_path).await
+        .with_context(|| format!("reading CA cert: {ca_cert_path}"))?;
 
-async fn login(server: &str, username: &str, password: &str) -> Result<LoginResponse> {
-    let resp = reqwest::Client::new()
-        .post(format!("{server}/api/login"))
-        .json(&LoginRequest { username: username.into(), password: password.into() })
-        .send()
+    let auth = parse_operator_cert(&cert_pem)?;
+
+    let identity = Identity::from_pem(&cert_pem, &key_pem);
+    let ca_cert  = Certificate::from_pem(&ca_cert_pem);
+    let tls = ClientTlsConfig::new()
+        .identity(identity)
+        .ca_certificate(ca_cert)
+        .domain_name("wraith-server");
+
+    let channel = Channel::from_shared(endpoint.to_owned())?
+        .tls_config(tls)?
+        .connect()
         .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("server returned {}", resp.status());
-    }
-    Ok(resp.json::<LoginResponse>().await?)
+
+    Ok((OrchestratorClient::new(channel), auth))
 }
 
-fn auth_req<T>(body: T, token: &str) -> tonic::Request<T> {
-    let mut req = tonic::Request::new(body);
-    let v = MetadataValue::try_from(format!("Bearer {token}")).unwrap();
-    req.metadata_mut().insert("authorization", v);
-    req
+fn parse_operator_cert(pem_bytes: &[u8]) -> Result<AuthState> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(pem_bytes)
+        .map_err(|e| anyhow::anyhow!("PEM parse: {e:?}"))?;
+    let (_, cert) = X509Certificate::from_der(&pem.contents)
+        .map_err(|e| anyhow::anyhow!("cert parse: {e:?}"))?;
+
+    let username = cert
+        .subject()
+        .iter_common_name()
+        .next()
+        .and_then(|a| a.as_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let role = cert
+        .subject()
+        .iter_organizational_unit()
+        .next()
+        .and_then(|a| a.as_str().ok())
+        .unwrap_or("operator")
+        .to_string();
+
+    Ok(AuthState { username, role })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
     tracing_subscriber::fmt().with_env_filter("warn").init();
     let args = Args::parse();
     let rt   = Arc::new(Builder::new_multi_thread().enable_all().build()?);

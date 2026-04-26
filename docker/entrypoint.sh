@@ -25,4 +25,17 @@ if [ -f /run/secrets/redirector_token ]; then
     fi
 fi
 
+if [ -f /run/secrets/ca_passphrase ]; then
+    CA_PASSPHRASE=$(cat /run/secrets/ca_passphrase)
+    if [ -n "$CA_PASSPHRASE" ]; then
+        export CA_PASSPHRASE
+    else
+        # Empty passphrase file — inject the dev flag so the server starts with a warning
+        # instead of refusing. Set a real passphrase in production.
+        set -- "$@" --dev-no-passphrase
+    fi
+else
+    set -- "$@" --dev-no-passphrase
+fi
+
 exec "$@"

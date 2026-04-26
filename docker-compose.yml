@@ -24,6 +24,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     restart: unless-stopped
+    # Bind to all container interfaces so Docker can forward the host-side ports below.
+    # Host-side restriction (127.0.0.1:...) is enforced by the ports mapping, not here.
+    command: ["wraith-server", "--grpc-addr", "0.0.0.0:50051", "--http-addr", "0.0.0.0:8080"]
     volumes:
       - /etc/localtime:/etc/localtime:ro
     depends_on:
@@ -32,9 +35,10 @@ services:
     secrets:
       - postgres_password
       - redirector_token
+      - ca_passphrase
     ports:
-      - "127.0.0.1:8080:8080"    # HTTP — implant check-ins and operator login
-      - "127.0.0.1:50051:50051"  # gRPC — operator client
+      - "127.0.0.1:8080:8080"    # HTTP  — implant check-ins (plain, host-only)
+      - "127.0.0.1:50051:50051"  # gRPC  — operator client (mTLS, host-only)
     networks:
       - internal
     healthcheck:
@@ -73,6 +77,8 @@ secrets:
     file: ./secrets/postgres_password
   redirector_token:
     file: ./secrets/redirector_token
+  ca_passphrase:
+    file: ./secrets/ca_passphrase
 
 networks:
   internal:

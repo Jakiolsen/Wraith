@@ -30,22 +30,22 @@ The server and redirector run inside Docker only. The operator client runs local
 **Prerequisites:** Docker, Docker Compose, Rust (stable)
 
 ```bash
-# 1. Write credentials into secret files (input is hidden, chmod 600)
+# 1. Write secret files (postgres password, CA passphrase, redirector token)
 make docker-secrets
 
 # 2. Start Postgres + server + redirector
 make docker-up
 
-# 3. Provision the admin operator account (first time only)
-make docker-provision
+# 3. Issue an operator mTLS certificate (writes to ./certs/)
+make docker-provision        # USERNAME=admin by default
 
-# 4. Build and run the operator client locally
-make client
+# 4. Build and run the operator client with the provisioned cert
+make client                  # USERNAME=admin by default
 ```
 
 The server exposes two ports on `127.0.0.1` only:
-- `:8080` — operator login + (direct) implant check-ins
-- `:50051` — gRPC for the operator client
+- `:8080` — implant check-ins (plain HTTP, token-gated by redirector token)
+- `:50051` — gRPC operator API (mTLS — client certificate required)
 
 The redirector exposes `:8443` on all interfaces — this is the address implants contact in production.
 
@@ -172,20 +172,27 @@ make release    # release build
 
 ## Architecture
 
-- **Auth**: operators log in via `POST /api/login` and receive a UUID bearer token held in memory. This is a placeholder — Step 2 of the plan replaces it with mutual TLS (operator `.p12` certificate, no passwords).
-- **Database**: PostgreSQL stores operators, implant sessions, and tasks. Sessions are upserted on every check-in; tasks are queued and returned to the implant on the next check-in.
-- **Active detection**: a session is marked active if `last_seen` is within the last 2 minutes.
-- **Redirector token**: if the `redirector_token` secret is non-empty, implant HTTP routes require `X-Wraith-Redirector-Token: <token>`. Leave it empty to allow direct connections.
-- **Beacon jitter**: sleep duration is randomised ±`jitter_pct`% each cycle using a time-seeded value. Step 6 of the plan replaces this with a proper CSPRNG (`getrandom`).
+- **Auth**: mutual TLS on all gRPC connections. The server generates its own CA on first start (key encrypted at rest with AES-256-GCM, Argon2id KDF with locked params). Operators are issued leaf certs via `provision-operator`; the cert's CN is the operator username and OU is the role. No passwords, no bearer tokens.
+- **CA key in RAM**: the CA private key is dropped from process memory immediately after the TLS listener is configured. It is not resident while the server is handling connections.
+- **CRL**: revoked cert serials are stored in Postgres and loaded into memory every 60 seconds. Revoking an operator takes effect within one refresh cycle. Re-provisioning a cert automatically revokes the previous one.
+- **Database**: PostgreSQL stores CA state, operator certs, CRL, implant sessions, and tasks. Sessions are upserted on every check-in; tasks are queued and returned to the implant on the next check-in.
+- **Session integrity**: the server only accepts a client-supplied session ID if it was previously issued by this server. Unknown IDs trigger re-registration. Task results are cross-referenced by `(task_id, session_id)` so one implant cannot overwrite another's results.
+- **Body limit**: implant HTTP endpoints reject requests over 1 MB (returns 413).
+- **Active detection**: a session is marked active if `last_seen` is within the last 2 minutes. All timestamps are UTC.
+- **Redirector token**: if the `redirector_token` secret is non-empty, implant HTTP routes require `x-wraith-redirector-token: <token>` (constant-time comparison). Leave it empty to allow direct connections.
+- **Beacon jitter**: sleep duration is randomised ±`jitter_pct`% each cycle. Step 6 of the plan replaces this with a CSPRNG (`getrandom`).
 
 ---
 
 ## Security notes
 
-- The server gRPC port (50051) should not be reachable from outside the host; use firewall rules or a WireGuard VPN.
-- Operator tokens are in-memory only and are invalidated on server restart.
-- Postgres is unreachable outside the Docker network; its credentials never appear in env vars or logs.
-- See `PLAN.md` for the full implementation roadmap including mTLS, RBAC, audit logging, and evasion.
+- `CA_PASSPHRASE` is required at startup. The server refuses to start if it is absent or empty unless `--dev-no-passphrase` is explicitly passed (development only).
+- Operator private key files are written with mode 0600 — not readable by other local users regardless of umask.
+- Operator private keys are never stored server-side — generated during provisioning, returned once, gone.
+- The gRPC port (50051) defaults to `127.0.0.1` and is only accessible from the host machine. In Docker, port isolation is enforced by the `127.0.0.1:50051:50051` mapping in `docker-compose.yml`.
+- Postgres is unreachable outside the Docker network; credentials are never in env vars or logs.
+- To revoke an operator: `docker compose run --rm server wraith-server revoke-operator --username <n>`. Takes effect on the next connection attempt (within 60 seconds).
+- See `PLAN.md` for the full implementation roadmap including RBAC, audit logging, and evasion.
 
 ---
 
@@ -200,16 +207,16 @@ Wraith/
 ├── docker/
 │   ├── Dockerfile           server image (cargo-chef 4-stage build)
 │   ├── Dockerfile.redirector
-│   ├── entrypoint.sh        reads postgres_password secret, sets DATABASE_URL
+│   ├── entrypoint.sh        reads postgres_password + ca_passphrase secrets
 │   └── entrypoint.redirector.sh  reads redirector_token secret
 ├── secrets/                 credential files (git-ignored)
 │   ├── postgres_password
+│   ├── ca_passphrase        encrypts the CA private key at rest
 │   └── redirector_token
-├── proto/
-│   └── orchestrator.proto
+├── certs/                   operator cert/key files (git-ignored, written by make docker-provision)
 ├── shared/                  wire types + protobuf generated code
-├── server/                  C2 server (axum HTTP + tonic gRPC + sqlx PG)
-├── client/                  operator GUI (eframe/egui)
+├── server/                  C2 server (axum HTTP + tonic gRPC mTLS + sqlx PG)
+├── client/                  operator GUI (eframe/egui, mTLS connect)
 ├── implant/                 agent (beacon loop + module registry)
 │   └── src/modules/
 │       ├── common/          shell, file_get, file_put, proc_list, sysinfo

@@ -36,8 +36,10 @@ test: ## Run all tests
 client: ## Build and run the operator GUI
 	cargo build -p client
 	./target/debug/client \
-		--server http://127.0.0.1:8080 \
-		--grpc   http://127.0.0.1:50051
+		--grpc    https://127.0.0.1:50051 \
+		--cert    certs/$(USERNAME).cert.pem \
+		--key     certs/$(USERNAME).key.pem \
+		--ca-cert certs/ca.cert.pem
 
 # ── Implant ───────────────────────────────────────────────────────────────────
 
@@ -57,6 +59,9 @@ docker-secrets: ## Write secret files interactively (input is hidden)
 	@printf 'Postgres password (input hidden): '; stty -echo; read PG; stty echo; echo; \
 	printf '%s' "$$PG" > secrets/postgres_password; chmod 600 secrets/postgres_password; \
 	echo "secrets/postgres_password written."; \
+	printf 'CA passphrase (protects CA private key — leave blank only for dev, required in production): '; stty -echo; read CP; stty echo; echo; \
+	printf '%s' "$$CP" > secrets/ca_passphrase; chmod 600 secrets/ca_passphrase; \
+	echo "secrets/ca_passphrase written."; \
 	printf 'Redirector token (leave blank to skip): '; stty -echo; read RT; stty echo; echo; \
 	if [ -n "$$RT" ]; then \
 		printf '%s' "$$RT" > secrets/redirector_token; \
@@ -82,8 +87,11 @@ docker-logs: ## Tail server logs
 docker-redirector-logs: ## Tail redirector logs
 	docker compose logs -f redirector
 
-docker-provision: ## Create or reset the admin account inside Docker
-	docker compose exec server /entrypoint.sh wraith-server provision-admin --username $(USERNAME)
+docker-provision: ## Provision an operator cert (writes to ./certs/)
+	@mkdir -p certs
+	docker compose run --rm -v $(PWD)/certs:/certs server \
+		wraith-server provision-operator --username $(USERNAME) --role admin --out-dir /certs
+	@echo "Cert files written to ./certs/ — run: make client"
 
 docker-build: ## Rebuild the server image after code changes
 	docker compose build server

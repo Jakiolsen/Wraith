@@ -4,21 +4,6 @@ pub mod proto {
     tonic::include_proto!("orchestrator");
 }
 
-// ── Operator auth (HTTP) ──────────────────────────────────────────────────────
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LoginRequest {
-    pub username: String,
-    pub password: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LoginResponse {
-    pub token:    String,
-    pub username: String,
-    pub role:     String,
-}
-
 // ── Implant wire types (HTTP) ─────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
