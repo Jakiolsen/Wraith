@@ -74,7 +74,7 @@ impl AppState {
         match &self.redirector_token {
             None => true,
             Some(expected) => headers
-                .get("x-wraith-token")
+                .get("x-wraith-redirector-token")
                 .and_then(|v| v.to_str().ok())
                 .map(|v| v == expected)
                 .unwrap_or(false),

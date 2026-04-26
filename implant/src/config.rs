@@ -11,9 +11,9 @@ macro_rules! env_or {
     };
 }
 
-const DEFAULT_C2_BASE_URL:  &str = env_or!("WRAITH_C2_URL",      "http://127.0.0.1:8080");
-const DEFAULT_CHECKIN_URI:  &str = env_or!("WRAITH_CHECKIN_URI", "/implant/checkin");
-const DEFAULT_RESULT_URI:   &str = env_or!("WRAITH_RESULT_URI",  "/implant/result");
+const DEFAULT_C2_BASE_URL:  &str = env_or!("WRAITH_C2_URL",      "http://127.0.0.1:8443");
+const DEFAULT_CHECKIN_URI:  &str = env_or!("WRAITH_CHECKIN_URI", "/api/v1/update");
+const DEFAULT_RESULT_URI:   &str = env_or!("WRAITH_RESULT_URI",  "/api/v1/result");
 const DEFAULT_PROFILE_NAME: &str = env_or!("WRAITH_PROFILE",     "default-https");
 const DEFAULT_SLEEP_MS:     u64  = 5_000;
 const DEFAULT_JITTER_PCT:   u64  = 20;
