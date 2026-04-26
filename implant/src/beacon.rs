@@ -158,9 +158,7 @@ fn jittered_sleep(base_ms: u64, jitter_pct: u64) -> u64 {
 }
 
 fn hostname() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "unknown".to_owned())
+    sysinfo::System::host_name().unwrap_or_else(|| "unknown".to_owned())
 }
 
 fn username() -> String {
