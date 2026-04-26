@@ -194,7 +194,7 @@ async fn record_result(pool: &PgPool, r: &ImplantTaskResult) -> Result<()> {
 }
 
 fn chrono_now() -> String {
-    chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string()
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S %z").to_string()
 }
 
 // ── HTTP handlers ─────────────────────────────────────────────────────────────
@@ -304,7 +304,7 @@ impl Orchestrator for GrpcApi {
             .iter()
             .map(|r| {
                 let last_seen: String = r.get("last_seen");
-                let active = chrono::DateTime::parse_from_str(&last_seen, "%Y-%m-%d %H:%M:%S UTC")
+                let active = chrono::DateTime::parse_from_str(&last_seen, "%Y-%m-%d %H:%M:%S %z")
                     .map(|t| t.with_timezone(&chrono::Utc) > cutoff)
                     .unwrap_or(false);
                 SessionSnapshot {
