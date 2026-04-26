@@ -480,7 +480,74 @@ fn pretty_output(json: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return json.into() };
     if let Some(s) = v.get("stdout").and_then(|x| x.as_str()) { return s.trim().into(); }
     if let Some(s) = v.get("error").and_then(|x| x.as_str())  { return format!("error: {s}"); }
+    if let Some(procs) = v.get("processes").and_then(|p| p.as_array()) {
+        return format_proc_tree(procs);
+    }
     serde_json::to_string_pretty(&v).unwrap_or_default()
+}
+
+fn format_proc_tree(procs: &[serde_json::Value]) -> String {
+    use std::collections::HashMap;
+
+    let pid_set: std::collections::HashSet<u32> = procs.iter()
+        .filter_map(|p| p["pid"].as_u64().map(|v| v as u32))
+        .collect();
+
+    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+
+    for (i, proc) in procs.iter().enumerate() {
+        let ppid = proc["ppid"].as_u64().unwrap_or(0) as u32;
+        if ppid == 0 || !pid_set.contains(&ppid) {
+            roots.push(i);
+        } else {
+            children.entry(ppid).or_default().push(i);
+        }
+    }
+
+    roots.sort_by_key(|&i| procs[i]["pid"].as_u64().unwrap_or(0));
+    for kids in children.values_mut() {
+        kids.sort_by_key(|&i| procs[i]["pid"].as_u64().unwrap_or(0));
+    }
+
+    let mut out = format!("{} processes\n\n", procs.len());
+    for (i, &root) in roots.iter().enumerate() {
+        render_proc_node(root, procs, &children, "", i == roots.len() - 1, &mut out);
+    }
+    out
+}
+
+fn render_proc_node(
+    idx:      usize,
+    procs:    &[serde_json::Value],
+    children: &std::collections::HashMap<u32, Vec<usize>>,
+    prefix:   &str,
+    is_last:  bool,
+    out:      &mut String,
+) {
+    let p    = &procs[idx];
+    let pid  = p["pid"].as_u64().unwrap_or(0) as u32;
+    let name = p["name"].as_str().unwrap_or("?");
+    let user = p["user"].as_str().unwrap_or("");
+    let mem  = p["mem_kb"].as_u64().unwrap_or(0);
+    let mem_str = if mem >= 1024 {
+        format!("{:.1}M", mem as f64 / 1024.0)
+    } else {
+        format!("{mem}K")
+    };
+
+    let connector   = if is_last { "└── " } else { "├── " };
+    let child_prefix = format!("{}{}", prefix, if is_last { "    " } else { "│   " });
+
+    out.push_str(&format!(
+        "{prefix}{connector}{pid:<6} {name:<22} {user:<14} {mem_str}\n"
+    ));
+
+    if let Some(kids) = children.get(&pid) {
+        for (i, &kid) in kids.iter().enumerate() {
+            render_proc_node(kid, procs, children, &child_prefix, i == kids.len() - 1, out);
+        }
+    }
 }
 
 // ── Network helpers ───────────────────────────────────────────────────────────
