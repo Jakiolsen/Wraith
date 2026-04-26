@@ -10,7 +10,7 @@ services:
       - postgres_password
     volumes:
       - pgdata:/var/lib/postgresql/data
-    # No ports: — Postgres is unreachable from outside Docker
+    # No ports: — Postgres is unreachable from outside the Docker network
     networks:
       - internal
     healthcheck:
@@ -31,8 +31,38 @@ services:
       - postgres_password
       - redirector_token
     ports:
-      - "127.0.0.1:8080:8080"    # localhost only — put a reverse proxy in front for remote access
-      - "127.0.0.1:50051:50051"  # localhost only — operator client connects from the same machine
+      - "127.0.0.1:8080:8080"    # HTTP — implant check-ins and operator login
+      - "127.0.0.1:50051:50051"  # gRPC — operator client
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /proc/1/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  redirector:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.redirector
+    restart: unless-stopped
+    depends_on:
+      server:
+        condition: service_healthy
+    secrets:
+      - redirector_token
+    ports:
+      - "0.0.0.0:8443:8443"   # Implant-facing HTTP — exposed externally
+    volumes:
+      - ./profiles/examples:/profiles:ro
+    command:
+      - wraith-redirector
+      - --listen
+      - 0.0.0.0:8443
+      - --profiles-dir
+      - /profiles
+      - --upstream
+      - http://server:8080
     networks:
       - internal
 

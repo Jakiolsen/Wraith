@@ -18,7 +18,6 @@ fi
 
 export DATABASE_URL="postgres://wraith:${PG_PASS}@postgres:5432/wraith"
 
-# Optional: redirector token
 if [ -f /run/secrets/redirector_token ]; then
     REDIRECTOR_TOKEN=$(cat /run/secrets/redirector_token)
     if [ -n "$REDIRECTOR_TOKEN" ]; then

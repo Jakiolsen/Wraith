@@ -31,10 +31,8 @@ const MUTED:      Color32 = Color32::from_rgb(120, 122, 140);
 
 #[derive(Parser, Clone)]
 struct Args {
-    /// gRPC address of the server (for session/task management)
     #[arg(long, default_value = "http://127.0.0.1:50051")]
     grpc: String,
-    /// HTTP address of the server (for login)
     #[arg(long, default_value = "http://127.0.0.1:8080")]
     server: String,
 }
@@ -43,32 +41,28 @@ struct Args {
 
 #[derive(Clone, Default)]
 struct UiState {
-    auth:        Option<LoginResponse>,
-    flash:       Option<String>,
-    sessions:    Vec<shared::proto::SessionSnapshot>,
-    tasks:       Vec<shared::proto::TaskResult>,
-    pending_login: bool,
+    auth:           Option<LoginResponse>,
+    flash:          Option<String>,
+    sessions:       Vec<shared::proto::SessionSnapshot>,
+    tasks:          Vec<shared::proto::TaskResult>,
+    pending_login:  bool,
 }
 
 struct App {
-    runtime:  Arc<Runtime>,
-    args:     Args,
-    state:    Arc<RwLock<UiState>>,
-    view:     View,
-    // login fields
-    username: String,
-    password: String,
-    // session fields
-    selected: Option<String>,
-    module:   String,
-    task_args: String,
+    runtime:      Arc<Runtime>,
+    args:         Args,
+    state:        Arc<RwLock<UiState>>,
+    view:         View,
+    username:     String,
+    password:     String,
+    selected:     Option<String>,
+    module:       String,
+    task_args:    String,
     last_refresh: Instant,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum View { Login, Sessions }
-
-// ── App logic ─────────────────────────────────────────────────────────────────
 
 impl App {
     fn new(runtime: Arc<Runtime>, args: Args) -> Self {
@@ -139,8 +133,8 @@ impl App {
     }
 
     fn do_dispatch(&self) {
-        let Some(sid) = self.selected.clone() else { self.flash("No session selected."); return };
-        let Some(token) = self.token()         else { self.flash("Not logged in."); return };
+        let Some(sid)   = self.selected.clone() else { self.flash("No session selected."); return };
+        let Some(token) = self.token()           else { self.flash("Not logged in."); return };
         let (grpc, state) = (self.args.grpc.clone(), self.state.clone());
         let args: Vec<String> = self.task_args.split_whitespace().map(str::to_owned).collect();
         let req = TaskRequest { session_id: sid, module: self.module.clone(), args };
@@ -187,7 +181,6 @@ impl eframe::App for App {
         configure_theme(ctx);
         ctx.request_repaint_after(Duration::from_millis(500));
 
-        // Transition Login → Sessions on successful auth
         if self.view == View::Login {
             if self.state.read().unwrap().auth.is_some() {
                 self.view = View::Sessions;
@@ -195,7 +188,6 @@ impl eframe::App for App {
             }
         }
 
-        // Auto-refresh sessions every 5 s
         if self.view == View::Sessions && self.last_refresh.elapsed() > Duration::from_secs(5) {
             self.do_refresh();
         }
@@ -290,10 +282,8 @@ fn render_sidebar(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
     ui.add_space(16.0);
     ui.separator();
     ui.add_space(10.0);
-
     nav_item(ui, "◈", "Sessions", true);
 
-    // Bottom: user + lock
     let h = ui.available_height();
     ui.add_space((h - 60.0).max(8.0));
     ui.separator();
@@ -335,7 +325,6 @@ fn nav_item(ui: &mut egui::Ui, icon: &str, label: &str, active: bool) {
 }
 
 fn render_sessions(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
-    // Header
     egui::Frame::new().fill(PANEL)
         .inner_margin(egui::Margin { left: 20, right: 20, top: 14, bottom: 14 })
         .show(ui, |ui| {
@@ -357,10 +346,9 @@ fn render_sessions(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
 
     ui.add(egui::Separator::default().horizontal().spacing(0.0));
 
-    let total_h = ui.available_height();
-    let console_h = if app.selected.is_some() { 240.0 } else { 0.0 };
+    let total_h    = ui.available_height();
+    let console_h  = if app.selected.is_some() { 240.0 } else { 0.0 };
 
-    // Session table
     egui::ScrollArea::vertical().id_salt("sess").max_height(total_h - console_h - 2.0)
         .auto_shrink([false, false]).show(ui, |ui| {
         ui.add_space(6.0);
@@ -373,7 +361,6 @@ fn render_sessions(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
             return;
         }
 
-        // Column headers
         egui::Frame::new().fill(Color32::from_rgb(12, 12, 18))
             .inner_margin(egui::Margin { left: 20, right: 20, top: 5, bottom: 5 })
             .show(ui, |ui| {
@@ -386,7 +373,7 @@ fn render_sessions(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
             });
 
         for s in &state.sessions {
-            let sel = app.selected.as_deref() == Some(&s.session_id);
+            let sel  = app.selected.as_deref() == Some(&s.session_id);
             let resp = egui::Frame::new()
                 .fill(if sel { Color32::from_rgba_unmultiplied(196, 43, 62, 22) } else { Color32::TRANSPARENT })
                 .stroke(if sel { egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(196, 43, 62, 80)) } else { egui::Stroke::NONE })
@@ -413,7 +400,6 @@ fn render_sessions(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
         }
     });
 
-    // Task console
     if app.selected.is_some() {
         ui.add(egui::Separator::default().horizontal().spacing(0.0));
         render_console(app, ui, state);
@@ -432,7 +418,7 @@ fn render_console(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
                 egui::ComboBox::from_id_salt("mod").width(90.0)
                     .selected_text(egui::RichText::new(&app.module).size(12.0).color(TEXT))
                     .show_ui(ui, |ui| {
-                        for m in ["shell","file_get","file_put","proc_list","sysinfo"] {
+                        for m in ["shell", "file_get", "file_put", "proc_list", "sysinfo"] {
                             ui.selectable_value(&mut app.module, m.into(), m);
                         }
                     });
@@ -448,8 +434,6 @@ fn render_console(app: &mut App, ui: &mut egui::Ui, state: &UiState) {
                 {
                     app.do_dispatch();
                 }
-
-                // flash inline
                 if let Some(msg) = &state.flash {
                     ui.add_space(8.0);
                     ui.label(egui::RichText::new(msg).size(11.0).color(Color32::from_rgb(180, 140, 150)));
