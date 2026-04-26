@@ -483,7 +483,38 @@ fn pretty_output(json: &str) -> String {
     if let Some(procs) = v.get("processes").and_then(|p| p.as_array()) {
         return format_proc_tree(procs);
     }
+    if v.get("hostname").is_some() && v.get("uptime_secs").is_some() {
+        return format_sysinfo(&v);
+    }
     serde_json::to_string_pretty(&v).unwrap_or_default()
+}
+
+fn format_sysinfo(v: &serde_json::Value) -> String {
+    let hostname  = v["hostname"].as_str().unwrap_or("unknown");
+    let os        = v["os"].as_str().unwrap_or("unknown");
+    let kernel    = v["kernel"].as_str().unwrap_or("unknown");
+    let arch      = v["arch"].as_str().unwrap_or("unknown");
+    let cpus      = v["cpu_count"].as_u64().unwrap_or(0);
+    let total_mb  = v["total_memory_mb"].as_u64().unwrap_or(0);
+    let used_mb   = v["used_memory_mb"].as_u64().unwrap_or(0);
+    let uptime    = v["uptime_secs"].as_u64().unwrap_or(0);
+
+    let days    = uptime / 86400;
+    let hours   = (uptime % 86400) / 3600;
+    let minutes = (uptime % 3600) / 60;
+    let uptime_str = match (days, hours, minutes) {
+        (0, 0, m) => format!("{m}m"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, h, m) => format!("{d}d {h}h {m}m"),
+    };
+
+    let mem_pct = if total_mb > 0 { used_mb * 100 / total_mb } else { 0 };
+    let bar_filled = (mem_pct / 5) as usize;
+    let mem_bar = format!("[{}{}]", "█".repeat(bar_filled), "░".repeat(20 - bar_filled));
+
+    format!(
+        "  Hostname  {hostname}\n  OS        {os}\n  Kernel    {kernel}\n  Arch      {arch}\n  CPUs      {cpus}\n  Memory    {mem_bar} {used_mb}M / {total_mb}M ({mem_pct}%)\n  Uptime    {uptime_str}"
+    )
 }
 
 fn format_proc_tree(procs: &[serde_json::Value]) -> String {
