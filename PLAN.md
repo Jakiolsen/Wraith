@@ -201,7 +201,7 @@ Replace password auth with mutual TLS. This is the security bedrock everything e
 
 ---
 
-### Step 4 — Docker Hardening + CI/CD
+### Step 4 — Docker Hardening
 
 **4.1 Production Dockerfile** ✅
 - 4-stage build: planner → dependency cache (cargo-chef) → builder → `debian:bookworm-slim` runtime
@@ -214,17 +214,13 @@ Replace password auth with mutual TLS. This is the security bedrock everything e
 - Redirector: separate image, depends on server healthcheck, exposes `0.0.0.0:8443`
 - ☐ `docker-compose.prod.yml` with resource limits and `json-file` log driver with size caps
 
-**4.3 GitHub Actions CI** ☐
-- `.github/workflows/ci.yml`: on every PR — `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo audit`
-- Dependency audit on schedule (daily); build cache via `actions/cache`
+**4.3 Implant cross-compilation** ☐
+- `cross` for hermetic `x86_64-unknown-linux-musl` and `x86_64-pc-windows-gnu` builds
+- Windows implant signed offline with `osslsigncode` using a locally-held Authenticode cert
+- Linux implant optionally GPG-signed; detached `.sig` file kept alongside the binary
+- Build happens on the operator machine; no third-party build infrastructure involved
 
-**4.4 Release workflow** ☐
-- `.github/workflows/release.yml`: on tag `v*` — cross-compile implant for `x86_64-unknown-linux-musl` and `x86_64-pc-windows-gnu`
-- Artifacts uploaded to GitHub Release; hermetic offline build
-- Windows implant signed with Authenticode via `osslsigncode` in CI (cert stored as an encrypted GitHub secret)
-- Linux implant optionally GPG-signed; detached `.sig` file published alongside the binary
-
-**Checkpoint:** `git push` triggers CI; a failed `cargo audit` or clippy warning blocks the merge.
+**Checkpoint:** `make docker-up` brings the full stack up from zero. `make implant-linux` and `make implant-windows` produce statically-linked release binaries with no system dependencies.
 
 ---
 
@@ -735,7 +731,7 @@ Build the full GUI after the server API is stable. Each view maps directly to se
     │        │
     │        └──► Step 5 (redirector hardening + burn detection)
     │
-    ├──► Step 4 (Docker hardening + CI/CD + signing)  ← partial ✅; CI/CD remaining
+    ├──► Step 4 (Docker hardening + offline signing)  ← partial ✅; prod compose + cross-compile remaining
     │
     ├──► Step 6 (implant OPSEC: kill date, HMAC, X25519, anti-sandbox, staging)
     │        │
@@ -792,4 +788,3 @@ Fix the isolation before moving on.
 | Cross-compilation | `cross` (Docker-based) |
 | Code signing | `osslsigncode` (Windows), GPG (Linux) |
 | Infrastructure | Ansible, Terraform, Docker Compose |
-| CI/CD | GitHub Actions |
