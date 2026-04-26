@@ -4,7 +4,6 @@ pub mod proc_list;
 pub mod shell;
 pub mod sysinfo;
 
-// Re-export so submodules can write `use super::Module` as before.
 pub use super::Module;
 
 pub fn modules() -> Vec<Box<dyn Module>> {

@@ -2,21 +2,25 @@
 name    = "server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "wraith-server"
+path = "src/main.rs"
 
 [dependencies]
-anyhow.workspace           = true
-argon2.workspace           = true
-axum.workspace             = true
-chrono.workspace           = true
-clap.workspace             = true
-rand_core.workspace        = true
-serde.workspace            = true
-serde_json.workspace       = true
-sqlx.workspace             = true
-tokio.workspace            = true
-tokio-stream.workspace     = true
-tonic.workspace            = true
-tracing.workspace          = true
+anyhow.workspace             = true
+argon2.workspace             = true
+axum.workspace               = true
+chrono.workspace             = true
+clap.workspace               = true
+rand_core.workspace          = true
+serde.workspace              = true
+serde_json.workspace         = true
+sqlx.workspace               = true
+tokio.workspace              = true
+tonic.workspace              = true
+tracing.workspace            = true
 tracing-subscriber.workspace = true
-uuid.workspace             = true
+uuid.workspace               = true
 shared = { path = "../shared" }

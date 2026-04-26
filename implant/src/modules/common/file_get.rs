@@ -5,9 +5,7 @@ use serde_json::Value;
 pub struct FileGetModule;
 
 impl Module for FileGetModule {
-    fn name(&self) -> &'static str {
-        "file_get"
-    }
+    fn name(&self) -> &'static str { "file_get" }
 
     fn execute(&self, args: &[String]) -> Value {
         let Some(path) = args.first() else {

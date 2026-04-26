@@ -20,7 +20,6 @@ pub struct LoginResponse {
 }
 
 // ── Implant wire types (HTTP) ─────────────────────────────────────────────────
-// These must match the JSON schemas the implant posts.
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImplantCheckin {

@@ -5,9 +5,7 @@ use std::process::Command;
 pub struct ShellModule;
 
 impl Module for ShellModule {
-    fn name(&self) -> &'static str {
-        "shell"
-    }
+    fn name(&self) -> &'static str { "shell" }
 
     fn execute(&self, args: &[String]) -> Value {
         let command = args.join(" ");

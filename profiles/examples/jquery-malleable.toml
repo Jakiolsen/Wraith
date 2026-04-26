@@ -1,19 +1,19 @@
 [profile]
-name = "jquery-malleable"
-sleep_ms = 8000
-jitter_pct = 30
+name        = "jquery-malleable"
+sleep_ms    = 8000
+jitter_pct  = 30
 description = "Mimics jQuery CDN requests; blends into web-heavy environments"
 
 [transport]
-protocol = "https"
-host = "cdn.example.com"
-port = 443
+protocol             = "https"
+host                 = "cdn.example.com"
+port                 = 443
 accept_invalid_certs = false
 
 [http]
-checkin_uri = "/ajax/libs/jquery/3.7.1/jquery.min.js"
-result_uri  = "/ajax/libs/jquery/3.7.1/jquery.js"
-user_agent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+checkin_uri       = "/ajax/libs/jquery/3.7.1/jquery.min.js"
+result_uri        = "/ajax/libs/jquery/3.7.1/jquery.js"
+user_agent        = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 uri_append_random = true
 
 [http.headers]
@@ -23,7 +23,8 @@ Referer         = "https://www.example.com/"
 DNT             = "1"
 
 [server]
-redirector_token       = "CHANGE_ME_STRONG_SECRET"
-internal_checkin_uri   = "/implant/checkin"
-internal_result_uri    = "/implant/result"
-decoy_url              = "https://cdnjs.cloudflare.com"
+# Token must match the redirector_token secret set via `make docker-secrets`.
+redirector_token     = ""
+internal_checkin_uri = "/implant/checkin"
+internal_result_uri  = "/implant/result"
+decoy_url            = "https://cdnjs.cloudflare.com"

