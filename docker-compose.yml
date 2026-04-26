@@ -24,6 +24,8 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     restart: unless-stopped
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
     depends_on:
       postgres:
         condition: service_healthy
